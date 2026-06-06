@@ -1,0 +1,132 @@
+name: Fill model responses
+
+"on":
+  pull_request:
+    branches:
+      - qwen
+      - gemma
+      - phi
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fill-responses-${{ github.event.pull_request.number }}-${{ github.base_ref }}
+  cancel-in-progress: true
+
+jobs:
+  fill-responses:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      MODEL_BRANCH: ${{ github.base_ref }}
+      RESULTS_DIR: results/${{ github.base_ref }}
+
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve model for target branch
+        id: model
+        shell: bash
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          model=$(jq -r --arg branch "$MODEL_BRANCH" '.[$branch].ollama_model // empty' configs/models.json)
+          display_name=$(jq -r --arg branch "$MODEL_BRANCH" '.[$branch].display_name // empty' configs/models.json)
+          if [[ -z "$model" || -z "$display_name" ]]; then
+            echo "No model is configured for branch: $MODEL_BRANCH" >&2
+            exit 1
+          fi
+          echo "model=$model" >> "$GITHUB_OUTPUT"
+          echo "display_name=$display_name" >> "$GITHUB_OUTPUT"
+          jq -n \
+            --arg branch "$MODEL_BRANCH" \
+            --arg model "$model" \
+            --arg display_name "$display_name" \
+            '{branch: $branch, model: $model, display_name: $display_name}' \
+            > "$RESULTS_DIR/model.json"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Install Ollama
+        shell: bash
+        run: |
+          curl -fsSL https://ollama.com/install.sh -o /tmp/install-ollama.sh
+          sh /tmp/install-ollama.sh 2>&1 | tee "$RESULTS_DIR/ollama-install.log"
+
+      - name: Start Ollama
+        shell: bash
+        run: |
+          nohup ollama serve > "$RESULTS_DIR/ollama-server.log" 2>&1 &
+          echo $! > "$RESULTS_DIR/ollama-server.pid"
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Ollama did not become ready within 60 seconds." >&2
+          exit 1
+
+      - name: Pull ${{ steps.model.outputs.display_name }}
+        shell: bash
+        run: |
+          started=$(date +%s)
+          ollama pull '${{ steps.model.outputs.model }}' 2>&1 | tee "$RESULTS_DIR/model-pull.log"
+          completed=$(date +%s)
+          jq -n \
+            --arg model '${{ steps.model.outputs.model }}' \
+            --argjson duration_seconds "$((completed - started))" \
+            '{model: $model, duration_seconds: $duration_seconds}' \
+            > "$RESULTS_DIR/model-pull-timing.json"
+
+      - name: Fill actual_output fields
+        id: generation
+        continue-on-error: true
+        shell: bash
+        run: |
+          python runners/run_responses.py \
+            --model '${{ steps.model.outputs.model }}' \
+            --model-name "$MODEL_BRANCH" \
+            --input dataset/responses.json \
+            --output-dir "$RESULTS_DIR" \
+            --limit 10 \
+            --max-tokens 512 \
+            --num-ctx 16384 \
+            2>&1 | tee "$RESULTS_DIR/runner-console.log"
+
+      - name: Validate generated responses
+        id: validation
+        if: always()
+        continue-on-error: true
+        run: |
+          python runners/validate_responses.py \
+            "$RESULTS_DIR/responses.json" \
+            --expected-count 10 \
+            2>&1 | tee "$RESULTS_DIR/validation.log"
+
+      - name: Upload response files and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: responses-${{ github.base_ref }}-${{ github.run_id }}
+          path: results/${{ github.base_ref }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce generation result
+        if: always()
+        env:
+          GENERATION_OUTCOME: ${{ steps.generation.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
+        run: |
+          if [[ "$GENERATION_OUTCOME" != "success" || "$VALIDATION_OUTCOME" != "success" ]]; then
+            echo "Response generation or output validation failed." >&2
+            exit 1
+          fi
