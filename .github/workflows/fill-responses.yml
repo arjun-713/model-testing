@@ -15,12 +15,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
   fill-responses:
+    needs: tests
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - shard: "01"
+            offset: 0
+          - shard: "02"
+            offset: 10
+          - shard: "03"
+            offset: 20
+          - shard: "04"
+            offset: 30
+          - shard: "05"
+            offset: 40
     env:
       MODEL_BRANCH: ${{ github.base_ref }}
-      RESULTS_DIR: results/${{ github.base_ref }}
+      RESULTS_DIR: results/${{ github.base_ref }}/shard-${{ matrix.shard }}
 
     steps:
       - name: Check out pull request
@@ -36,6 +62,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RESULTS_DIR"
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$RESULTS_DIR/job-started-at.txt"
+          date +%s > "$RESULTS_DIR/job-started-epoch.txt"
           model=$(jq -r --arg branch "$MODEL_BRANCH" '.[$branch].ollama_model // empty' configs/models.json)
           display_name=$(jq -r --arg branch "$MODEL_BRANCH" '.[$branch].display_name // empty' configs/models.json)
           if [[ -z "$model" || -z "$display_name" ]]; then
@@ -48,11 +76,10 @@ jobs:
             --arg branch "$MODEL_BRANCH" \
             --arg model "$model" \
             --arg display_name "$display_name" \
-            '{branch: $branch, model: $model, display_name: $display_name}' \
+            --arg shard '${{ matrix.shard }}' \
+            --argjson offset '${{ matrix.offset }}' \
+            '{branch: $branch, model: $model, display_name: $display_name, shard: $shard, offset: $offset}' \
             > "$RESULTS_DIR/model.json"
-
-      - name: Run unit tests
-        run: python -m unittest discover -s tests -v
 
       - name: Install Ollama
         shell: bash
@@ -86,7 +113,7 @@ jobs:
             '{model: $model, duration_seconds: $duration_seconds}' \
             > "$RESULTS_DIR/model-pull-timing.json"
 
-      - name: Fill actual_output fields
+      - name: Fill shard actual_output fields
         id: generation
         continue-on-error: true
         shell: bash
@@ -96,12 +123,14 @@ jobs:
             --model-name "$MODEL_BRANCH" \
             --input dataset/responses.json \
             --output-dir "$RESULTS_DIR" \
+            --offset '${{ matrix.offset }}' \
             --limit 10 \
-            --max-tokens 512 \
+            --max-tokens 256 \
+            --temperature 0.1 \
             --num-ctx 16384 \
             2>&1 | tee "$RESULTS_DIR/runner-console.log"
 
-      - name: Validate generated responses
+      - name: Validate shard responses
         id: validation
         if: always()
         continue-on-error: true
@@ -111,22 +140,115 @@ jobs:
             --expected-count 10 \
             2>&1 | tee "$RESULTS_DIR/validation.log"
 
-      - name: Upload response files and logs
+      - name: Record shard timing
+        if: always()
+        shell: bash
+        run: |
+          completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          completed_epoch=$(date +%s)
+          started_at=$(cat "$RESULTS_DIR/job-started-at.txt")
+          started_epoch=$(cat "$RESULTS_DIR/job-started-epoch.txt")
+          jq -n \
+            --arg started_at "$started_at" \
+            --arg completed_at "$completed_at" \
+            --arg shard '${{ matrix.shard }}' \
+            --argjson offset '${{ matrix.offset }}' \
+            --argjson duration_seconds "$((completed_epoch - started_epoch))" \
+            '{started_at: $started_at, completed_at: $completed_at, shard: $shard, offset: $offset, duration_seconds: $duration_seconds}' \
+            > "$RESULTS_DIR/job-timing.json"
+
+      - name: Upload shard responses and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: responses-${{ github.base_ref }}-${{ github.run_id }}
-          path: results/${{ github.base_ref }}/
+          name: responses-${{ github.base_ref }}-${{ github.run_id }}-shard-${{ matrix.shard }}
+          path: ${{ env.RESULTS_DIR }}/
           if-no-files-found: error
           retention-days: 14
 
-      - name: Enforce generation result
+      - name: Enforce shard result
         if: always()
         env:
           GENERATION_OUTCOME: ${{ steps.generation.outcome }}
           VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
         run: |
           if [[ "$GENERATION_OUTCOME" != "success" || "$VALIDATION_OUTCOME" != "success" ]]; then
-            echo "Response generation or output validation failed." >&2
+            echo "Shard response generation or validation failed." >&2
+            exit 1
+          fi
+
+  aggregate:
+    needs:
+      - tests
+      - fill-responses
+    if: always()
+    runs-on: ubuntu-24.04
+    env:
+      COMBINED_DIR: results/${{ github.base_ref }}/combined
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare aggregation directories
+        run: mkdir -p downloaded-shards "$COMBINED_DIR"
+
+      - name: Download all shard artifacts
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: responses-${{ github.base_ref }}-${{ github.run_id }}-shard-*
+          path: downloaded-shards
+
+      - name: Merge responses, logs, and timings
+        id: merge
+        continue-on-error: true
+        run: |
+          python runners/merge_shards.py \
+            --source dataset/responses.json \
+            --shards-dir downloaded-shards \
+            --output-dir "$COMBINED_DIR" \
+            --expected-shards 5
+
+      - name: Validate all 50 responses
+        id: validation
+        if: always()
+        continue-on-error: true
+        run: |
+          python runners/validate_responses.py \
+            "$COMBINED_DIR/responses.json" \
+            --expected-count 50 \
+            2>&1 | tee "$COMBINED_DIR/validation.log"
+
+      - name: Add timing report to workflow summary
+        if: always()
+        run: |
+          if [[ -f "$COMBINED_DIR/report.md" ]]; then
+            cat "$COMBINED_DIR/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload combined root artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: responses-${{ github.base_ref }}-${{ github.run_id }}-combined
+          path: ${{ env.COMBINED_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce complete matrix result
+        if: always()
+        env:
+          TEST_RESULT: ${{ needs.tests.result }}
+          MATRIX_RESULT: ${{ needs.fill-responses.result }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          MERGE_OUTCOME: ${{ steps.merge.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
+        run: |
+          if [[ "$TEST_RESULT" != "success" || "$MATRIX_RESULT" != "success" || "$DOWNLOAD_OUTCOME" != "success" || "$MERGE_OUTCOME" != "success" || "$VALIDATION_OUTCOME" != "success" ]]; then
+            echo "One or more shards, merge, or final validation failed." >&2
             exit 1
           fi

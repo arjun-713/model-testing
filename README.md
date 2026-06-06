@@ -22,24 +22,32 @@ does not run the model workflow.
 
 ## CI behavior
 
-The workflow uses the first 10 entries from `dataset/responses.json`, caps each
-generation at 512 tokens, and writes a new response file under
-`results/<model-branch>/responses.json`. It does not modify the committed
-50-question source dataset.
+The workflow splits all 50 entries from `dataset/responses.json` into five
+parallel shards of 10 questions. Each answer is capped at 256 tokens and uses a
+temperature of 0.1. It does not modify the committed source dataset.
 
-The job passes only when all 10 selected entries contain a non-empty
-`actual_output`. Logs and partial results are uploaded even when generation or
-validation fails.
+Each shard runs on a separate GitHub-hosted runner and pulls its own copy of the
+selected model. An aggregation job rebuilds the 50 responses in source order.
+The workflow passes only when every `actual_output` is non-empty. Logs and
+partial results are uploaded even when generation or validation fails.
 
-The artifact contains:
+Each shard artifact contains:
 
-- `responses.json`: the 10 questions with generated outputs
+- `responses.json`: that shard's 10 questions with generated outputs
 - `summary.json`: total and average response time, fill count, and failed IDs
-- `<model>.log`: readable per-question logs including generated answers
-- `<model>.jsonl`: structured timing, token counts, answers, and Ollama metrics
+- `<model>.log`: readable logs including generated answers
+- `<model>.jsonl`: timing, token counts, and Ollama metrics
 - `model-pull.log` and `model-pull-timing.json`: model download details
 - `ollama-server.log`: local model-server logs
 - `validation.log`: final output validation result
+
+The combined root artifact contains:
+
+- `responses.json`: all 50 responses in the original dataset order
+- `summary.json`: parallel and summed timings, model pull time, and speedup
+- `report.md`: a readable timing report also shown in the workflow summary
+- `combined.jsonl`: structured events from all five shards
+- `shards/`: complete copies of every shard's files and logs
 
 ## Local checks
 
@@ -55,7 +63,9 @@ When Ollama is already running locally, a response run can be started with:
 python runners/run_responses.py \
   --model qwen3:4b-instruct \
   --model-name qwen \
+  --offset 0 \
   --limit 10 \
-  --max-tokens 512 \
+  --max-tokens 256 \
+  --temperature 0.1 \
   --output-dir results/qwen
 ```
