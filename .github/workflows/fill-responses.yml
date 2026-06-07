@@ -21,7 +21,7 @@ jobs:
     env:
       MODEL_BRANCH: ${{ github.base_ref }}
       RESULTS_DIR: results/${{ github.base_ref }}
-      JUDGE_MODEL: qwen3:4b-instruct
+      JUDGE_MODEL: phi4-mini
       CONFIDENT_API_KEY: ${{ secrets.CONFIDENT_API_KEY }}
       DEEPEVAL_DISABLE_DOTENV: "1"
       DEEPEVAL_TELEMETRY_OPT_OUT: "1"
@@ -128,7 +128,7 @@ jobs:
             --expected-count 10 \
             2>&1 | tee "$RESULTS_DIR/response-validation.log"
 
-      - name: Pull Qwen judge model
+      - name: Pull judge model
         if: steps.response_validation.outcome == 'success'
         shell: bash
         run: |
@@ -156,7 +156,7 @@ jobs:
             --judge-model "$JUDGE_MODEL" \
             --expected-count 10 \
             --threshold 0.5 \
-            --identifier "$MODEL_BRANCH-qwen-judge-pr-${{ github.event.pull_request.number }}" \
+            --identifier "$MODEL_BRANCH-phi-judge-pr-${{ github.event.pull_request.number }}" \
             2>&1 | tee "$RESULTS_DIR/deepeval-console.log"
 
       - name: Add evaluation report to workflow summary
