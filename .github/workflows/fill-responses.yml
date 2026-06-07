@@ -1,4 +1,4 @@
-name: Fill model responses
+name: Generate and judge responses
 
 "on":
   pull_request:
@@ -11,16 +11,20 @@ permissions:
   contents: read
 
 concurrency:
-  group: fill-responses-${{ github.event.pull_request.number }}-${{ github.base_ref }}
+  group: generate-judge-${{ github.event.pull_request.number }}-${{ github.base_ref }}
   cancel-in-progress: true
 
 jobs:
-  fill-responses:
+  generate-and-judge:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     env:
       MODEL_BRANCH: ${{ github.base_ref }}
       RESULTS_DIR: results/${{ github.base_ref }}
+      JUDGE_MODEL: qwen3:4b-instruct
+      CONFIDENT_API_KEY: ${{ secrets.CONFIDENT_API_KEY }}
+      DEEPEVAL_DISABLE_DOTENV: "1"
+      DEEPEVAL_TELEMETRY_OPT_OUT: "1"
 
     steps:
       - name: Check out pull request
@@ -30,8 +34,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-eval.txt
 
-      - name: Resolve model for target branch
+      - name: Resolve response model
         id: model
         shell: bash
         run: |
@@ -48,17 +54,26 @@ jobs:
             --arg branch "$MODEL_BRANCH" \
             --arg model "$model" \
             --arg display_name "$display_name" \
-            '{branch: $branch, model: $model, display_name: $display_name}' \
-            > "$RESULTS_DIR/model.json"
+            --arg judge_model "$JUDGE_MODEL" \
+            '{branch: $branch, response_model: $model, display_name: $display_name, judge_model: $judge_model}' \
+            > "$RESULTS_DIR/models.json"
+
+      - name: Install DeepEval
+        run: |
+          python -m pip install -r requirements-eval.txt \
+            2>&1 | tee "$RESULTS_DIR/dependency-install.log"
 
       - name: Run unit tests
-        run: python -m unittest discover -s tests -v
+        run: |
+          python -m unittest discover -s tests -v \
+            2>&1 | tee "$RESULTS_DIR/unit-tests.log"
 
       - name: Install Ollama
         shell: bash
         run: |
           curl -fsSL https://ollama.com/install.sh -o /tmp/install-ollama.sh
-          sh /tmp/install-ollama.sh 2>&1 | tee "$RESULTS_DIR/ollama-install.log"
+          sh /tmp/install-ollama.sh \
+            2>&1 | tee "$RESULTS_DIR/ollama-install.log"
 
       - name: Start Ollama
         shell: bash
@@ -74,19 +89,20 @@ jobs:
           echo "Ollama did not become ready within 60 seconds." >&2
           exit 1
 
-      - name: Pull ${{ steps.model.outputs.display_name }}
+      - name: Pull response model
         shell: bash
         run: |
           started=$(date +%s)
-          ollama pull '${{ steps.model.outputs.model }}' 2>&1 | tee "$RESULTS_DIR/model-pull.log"
+          ollama pull '${{ steps.model.outputs.model }}' \
+            2>&1 | tee "$RESULTS_DIR/response-model-pull.log"
           completed=$(date +%s)
           jq -n \
             --arg model '${{ steps.model.outputs.model }}' \
             --argjson duration_seconds "$((completed - started))" \
             '{model: $model, duration_seconds: $duration_seconds}' \
-            > "$RESULTS_DIR/model-pull-timing.json"
+            > "$RESULTS_DIR/response-model-pull-timing.json"
 
-      - name: Fill actual_output fields
+      - name: Fill 10 actual_output fields
         id: generation
         continue-on-error: true
         shell: bash
@@ -97,36 +113,76 @@ jobs:
             --input dataset/responses.json \
             --output-dir "$RESULTS_DIR" \
             --limit 10 \
-            --max-tokens 512 \
+            --max-tokens 256 \
+            --temperature 0.1 \
             --num-ctx 16384 \
-            2>&1 | tee "$RESULTS_DIR/runner-console.log"
+            2>&1 | tee "$RESULTS_DIR/response-generation-console.log"
 
       - name: Validate generated responses
-        id: validation
+        id: response_validation
         if: always()
         continue-on-error: true
         run: |
           python runners/validate_responses.py \
             "$RESULTS_DIR/responses.json" \
             --expected-count 10 \
-            2>&1 | tee "$RESULTS_DIR/validation.log"
+            2>&1 | tee "$RESULTS_DIR/response-validation.log"
 
-      - name: Upload response files and logs
+      - name: Pull Qwen judge model
+        if: steps.response_validation.outcome == 'success'
+        shell: bash
+        run: |
+          started=$(date +%s)
+          ollama pull "$JUDGE_MODEL" \
+            2>&1 | tee "$RESULTS_DIR/judge-model-pull.log"
+          completed=$(date +%s)
+          jq -n \
+            --arg model "$JUDGE_MODEL" \
+            --argjson duration_seconds "$((completed - started))" \
+            '{model: $model, duration_seconds: $duration_seconds}' \
+            > "$RESULTS_DIR/judge-model-pull-timing.json"
+
+      - name: Evaluate with DeepEval
+        id: evaluation
+        if: steps.response_validation.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          python evals/run_evaluation.py \
+            --responses "$RESULTS_DIR/responses.json" \
+            --goldens dataset/golden_dataset.json \
+            --output-dir "$RESULTS_DIR" \
+            --response-model "$MODEL_BRANCH" \
+            --judge-model "$JUDGE_MODEL" \
+            --expected-count 10 \
+            --threshold 0.5 \
+            --identifier "$MODEL_BRANCH-qwen-judge-pr-${{ github.event.pull_request.number }}" \
+            2>&1 | tee "$RESULTS_DIR/deepeval-console.log"
+
+      - name: Add evaluation report to workflow summary
+        if: always()
+        run: |
+          if [[ -f "$RESULTS_DIR/evaluation-report.md" ]]; then
+            cat "$RESULTS_DIR/evaluation-report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload responses, metrics, and all logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: responses-${{ github.base_ref }}-${{ github.run_id }}
-          path: results/${{ github.base_ref }}/
+          name: deepeval-${{ github.base_ref }}-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}/
           if-no-files-found: error
           retention-days: 14
 
-      - name: Enforce generation result
+      - name: Enforce complete generation and evaluation
         if: always()
         env:
           GENERATION_OUTCOME: ${{ steps.generation.outcome }}
-          VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
+          RESPONSE_VALIDATION_OUTCOME: ${{ steps.response_validation.outcome }}
+          EVALUATION_OUTCOME: ${{ steps.evaluation.outcome }}
         run: |
-          if [[ "$GENERATION_OUTCOME" != "success" || "$VALIDATION_OUTCOME" != "success" ]]; then
-            echo "Response generation or output validation failed." >&2
+          if [[ "$GENERATION_OUTCOME" != "success" || "$RESPONSE_VALIDATION_OUTCOME" != "success" || "$EVALUATION_OUTCOME" != "success" ]]; then
+            echo "Response generation, validation, or DeepEval judging failed." >&2
             exit 1
           fi

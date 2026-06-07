@@ -77,6 +77,7 @@ def post_chat(
     prompt: str,
     max_tokens: int,
     num_ctx: int,
+    temperature: float,
     timeout: float,
 ) -> dict[str, Any]:
     payload = {
@@ -90,7 +91,7 @@ def post_chat(
         "options": {
             "num_predict": max_tokens,
             "num_ctx": num_ctx,
-            "temperature": 0.2,
+            "temperature": temperature,
             "seed": 42,
         },
     }
@@ -161,15 +162,17 @@ def run(args: argparse.Namespace) -> int:
             "question_count": len(entries),
             "max_tokens": args.max_tokens,
             "num_ctx": args.num_ctx,
+            "temperature": args.temperature,
             "ollama_base_url": args.base_url,
         },
     )
     logger.info(
-        "Starting model=%s ollama_model=%s questions=%d max_tokens=%d",
+        "Starting model=%s ollama_model=%s questions=%d max_tokens=%d temperature=%.2f",
         args.model_name,
         args.model,
         len(entries),
         args.max_tokens,
+        args.temperature,
     )
 
     for index, entry in enumerate(entries, start=1):
@@ -207,6 +210,7 @@ def run(args: argparse.Namespace) -> int:
                     prompt=prompt,
                     max_tokens=args.max_tokens,
                     num_ctx=args.num_ctx,
+                    temperature=args.temperature,
                     timeout=args.request_timeout,
                 )
                 error = None
@@ -297,6 +301,8 @@ def run(args: argparse.Namespace) -> int:
         "started_at": run_started_at,
         "completed_at": utc_now(),
         "question_count": len(entries),
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
         "filled_count": sum(
             isinstance(entry, dict)
             and isinstance(entry.get("actual_output"), str)
@@ -343,6 +349,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--num-ctx", type=int, default=16384)
+    parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument(
         "--base-url",
         default=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
