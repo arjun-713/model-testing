@@ -305,9 +305,9 @@ def run(args: argparse.Namespace) -> int:
             },
             async_config=AsyncConfig(run_async=False, max_concurrent=1),
             display_config=DisplayConfig(
-                show_indicator=True,
+                show_indicator=False,
                 print_results=True,
-                verbose_mode=True,
+                verbose_mode=False,
                 truncate_passing_cases=False,
                 inspect_after_run=False,
                 file_type="md",
