@@ -50,8 +50,7 @@ jobs:
             --arg branch "$MODEL_BRANCH" \
             --arg model "$model" \
             --arg display_name "$display_name" \
-            --arg judge_model "$JUDGE_MODEL" \
-            '{branch: $branch, response_model: $model, display_name: $display_name, judge_model: $judge_model}' \
+            '{branch: $branch, response_model: $model, display_name: $display_name}' \
             > "$RESULTS_DIR/models.json"
 
       - name: Install DeepEval
@@ -161,6 +160,20 @@ jobs:
     steps:
       - name: Check out pull request
         uses: actions/checkout@v4
+
+      - name: Load Confident AI key from .env when secret is empty
+        shell: bash
+        run: |
+          if [[ -n "${CONFIDENT_API_KEY:-}" ]]; then
+            exit 0
+          fi
+          if [[ -f .env ]]; then
+            value=$(grep -E '^CONFIDENT_API_KEY=' .env | tail -n 1 | cut -d= -f2-)
+            if [[ -n "$value" ]]; then
+              echo "::add-mask::$value"
+              echo "CONFIDENT_API_KEY=$value" >> "$GITHUB_ENV"
+            fi
+          fi
 
       - name: Download generated responses
         uses: actions/download-artifact@v4

@@ -127,6 +127,7 @@ class DeepEvalPipelineTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(summary["generator_average_score"], 0.7)
+        self.assertEqual(summary["evaluation_status"], "complete")
         self.assertEqual(
             summary["metrics"]["Contextual Recall"]["average_score"], 0.4
         )
@@ -141,7 +142,96 @@ class DeepEvalPipelineTests(unittest.TestCase):
             self.assertIn("Generator average: 0.7", report)
             self.assertIn("Contextual Recall", report)
 
-    def test_summary_fails_when_a_metric_is_missing(self) -> None:
+    def test_summary_is_partial_when_metrics_have_some_scores_and_some_errors(self) -> None:
+        raw_result = {
+            "test_results": [
+                {
+                    "name": "q-001",
+                    "metadata": {"id": "q-001"},
+                    "metrics_data": [
+                        {
+                            "name": "Faithfulness",
+                            "threshold": 0.5,
+                            "success": True,
+                            "score": 0.8,
+                            "reason": "ok",
+                            "error": None,
+                            "evaluation_model": "phi4-mini",
+                        },
+                        {
+                            "name": "Answer Relevancy",
+                            "threshold": 0.5,
+                            "success": False,
+                            "score": None,
+                            "reason": None,
+                            "error": "ValidationError",
+                            "evaluation_model": "phi4-mini",
+                        },
+                        {
+                            "name": "Contextual Recall",
+                            "threshold": 0.5,
+                            "success": True,
+                            "score": 0.6,
+                            "reason": "ok",
+                            "error": None,
+                            "evaluation_model": "phi4-mini",
+                        },
+                    ],
+                },
+                {
+                    "name": "q-002",
+                    "metadata": {"id": "q-002"},
+                    "metrics_data": [
+                        {
+                            "name": "Faithfulness",
+                            "threshold": 0.5,
+                            "success": True,
+                            "score": 0.7,
+                            "reason": "ok",
+                            "error": None,
+                            "evaluation_model": "phi4-mini",
+                        },
+                        {
+                            "name": "Answer Relevancy",
+                            "threshold": 0.5,
+                            "success": True,
+                            "score": 0.55,
+                            "reason": "ok",
+                            "error": None,
+                            "evaluation_model": "phi4-mini",
+                        },
+                        {
+                            "name": "Contextual Recall",
+                            "threshold": 0.5,
+                            "success": False,
+                            "score": 0.45,
+                            "reason": "low",
+                            "error": None,
+                            "evaluation_model": "phi4-mini",
+                        },
+                    ],
+                },
+            ],
+            "confident_link": "https://app.confident-ai.com/test-runs/example",
+            "test_run_id": "run-id",
+        }
+
+        summary, errors = summarize_result(
+            raw_result=raw_result,
+            response_model="gemma",
+            judge_model="phi4-mini",
+            threshold=0.5,
+            expected_count=2,
+            started_at="2026-01-01T00:00:00+00:00",
+            duration_seconds=8.0,
+            confident_enabled=True,
+        )
+
+        self.assertEqual(summary["evaluation_status"], "partial")
+        self.assertEqual(summary["metrics"]["Answer Relevancy"]["average_score"], 0.55)
+        self.assertTrue(errors)
+
+    def test_summary_fails_when_a_metric_has_no_scores(self) -> None:
         raw_result = {
             "test_results": [
                 {

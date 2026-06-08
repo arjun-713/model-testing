@@ -199,6 +199,23 @@ def summarize_result(
             else None,
         }
 
+    complete_metric_count = sum(
+        metric_summary[name]["evaluated_count"] == expected_count for name in METRIC_NAMES
+    )
+    partial_metric_count = sum(
+        metric_summary[name]["evaluated_count"] > 0 for name in METRIC_NAMES
+    )
+    has_aggregate_scores = all(
+        metric_summary[name]["average_score"] is not None for name in METRIC_NAMES
+    )
+    evaluation_status = (
+        "complete"
+        if complete_metric_count == len(METRIC_NAMES)
+        else "partial"
+        if has_aggregate_scores and partial_metric_count == len(METRIC_NAMES)
+        else "failed"
+    )
+
     generator_scores = [
         metric_summary[name]["average_score"]
         for name in ("Faithfulness", "Answer Relevancy")
@@ -215,6 +232,9 @@ def summarize_result(
         "confident_ai_enabled": confident_enabled,
         "confident_link": raw_result.get("confident_link"),
         "test_run_id": raw_result.get("test_run_id"),
+        "evaluation_status": evaluation_status,
+        "complete_metric_count": complete_metric_count,
+        "partial_metric_count": partial_metric_count,
         "generator_average_score": round(statistics.fmean(generator_scores), 4)
         if generator_scores
         else None,
@@ -232,6 +252,7 @@ def write_report(summary: dict[str, Any], output_file: Path) -> None:
         "",
         f"- Judge model: `{summary['judge_model']}`",
         f"- Questions: {summary['question_count']}",
+        f"- Evaluation status: `{summary['evaluation_status']}`",
         f"- Evaluation time: {summary['duration_seconds']} seconds",
         f"- Generator average: {summary['generator_average_score']}",
         f"- Confident AI report: {summary.get('confident_link') or 'not uploaded'}",
@@ -349,14 +370,20 @@ def run(args: argparse.Namespace) -> int:
     save_json(args.output_dir / "evaluation-summary.json", summary)
     write_report(summary, args.output_dir / "evaluation-report.md")
 
-    if errors:
-        print("Evaluation completed with missing or invalid metric results:")
+    if summary["evaluation_status"] == "failed":
+        print("Evaluation failed because at least one metric has no aggregate score:")
         for error in errors:
             print(f"- {error}")
         return 1
 
+    if errors:
+        print("Evaluation completed with partial metric warnings:")
+        for error in errors:
+            print(f"- {error}")
+
     print(
         "Evaluation passed: "
+        f"status={summary['evaluation_status']} "
         f"generator_average_score={summary['generator_average_score']}"
     )
     return 0
