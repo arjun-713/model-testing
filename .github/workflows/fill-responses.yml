@@ -15,16 +15,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  generate-and-judge:
+  generate-responses:
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 180
     env:
       MODEL_BRANCH: ${{ github.base_ref }}
       RESULTS_DIR: results/${{ github.base_ref }}
-      JUDGE_MODEL: phi4-mini
-      CONFIDENT_API_KEY: ${{ secrets.CONFIDENT_API_KEY }}
-      DEEPEVAL_DISABLE_DOTENV: "1"
-      DEEPEVAL_TELEMETRY_OPT_OUT: "1"
 
     steps:
       - name: Check out pull request
@@ -128,23 +124,121 @@ jobs:
             --expected-count 10 \
             2>&1 | tee "$RESULTS_DIR/response-validation.log"
 
+      - name: Upload generated responses and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-responses-${{ github.base_ref }}-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce complete generation
+        if: always()
+        env:
+          GENERATION_OUTCOME: ${{ steps.generation.outcome }}
+          RESPONSE_VALIDATION_OUTCOME: ${{ steps.response_validation.outcome }}
+        run: |
+          if [[ "$GENERATION_OUTCOME" != "success" || "$RESPONSE_VALIDATION_OUTCOME" != "success" ]]; then
+            echo "Response generation or validation failed." >&2
+            exit 1
+          fi
+
+  evaluate-responses:
+    needs: generate-responses
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      MODEL_BRANCH: ${{ github.base_ref }}
+      RESULTS_DIR: results/${{ github.base_ref }}
+      CONFIDENT_API_KEY: ${{ secrets.CONFIDENT_API_KEY }}
+      DEEPEVAL_DISABLE_DOTENV: "1"
+      DEEPEVAL_TELEMETRY_OPT_OUT: "1"
+      DEEPEVAL_PER_TASK_TIMEOUT_SECONDS_OVERRIDE: "600"
+      DEEPEVAL_JUDGE_NUM_CTX: "4096"
+      DEEPEVAL_JUDGE_NUM_PREDICT: "256"
+
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@v4
+
+      - name: Download generated responses
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-responses-${{ github.base_ref }}-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Resolve judge model
+        id: judge
+        shell: bash
+        run: |
+          head_ref='${{ github.head_ref }}'
+          judge_model='qwen3:4b-instruct'
+          judge_slug='qwen'
+          if [[ "$head_ref" == *"phi-judge"* || "$head_ref" == judge-phi-* ]]; then
+            judge_model='phi4-mini'
+            judge_slug='phi'
+          elif [[ "$head_ref" == *"gemma-judge"* || "$head_ref" == judge-gemma-* ]]; then
+            judge_model='gemma3n:e4b'
+            judge_slug='gemma'
+          fi
+          echo "model=$judge_model" >> "$GITHUB_OUTPUT"
+          echo "slug=$judge_slug" >> "$GITHUB_OUTPUT"
+          jq -n \
+            --arg head_ref "$head_ref" \
+            --arg judge_model "$judge_model" \
+            --arg judge_slug "$judge_slug" \
+            '{head_ref: $head_ref, judge_model: $judge_model, judge_slug: $judge_slug}' \
+            > "$RESULTS_DIR/judge-model.json"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-eval.txt
+
+      - name: Install DeepEval
+        run: |
+          python -m pip install -r requirements-eval.txt \
+            2>&1 | tee -a "$RESULTS_DIR/dependency-install.log"
+
+      - name: Install Ollama
+        shell: bash
+        run: |
+          curl -fsSL https://ollama.com/install.sh -o /tmp/install-ollama.sh
+          sh /tmp/install-ollama.sh \
+            2>&1 | tee "$RESULTS_DIR/ollama-install.log"
+
+      - name: Start Ollama
+        shell: bash
+        run: |
+          nohup ollama serve > "$RESULTS_DIR/ollama-server.log" 2>&1 &
+          echo $! > "$RESULTS_DIR/ollama-server.pid"
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Ollama did not become ready within 60 seconds." >&2
+          exit 1
+
       - name: Pull judge model
-        if: steps.response_validation.outcome == 'success'
         shell: bash
         run: |
           started=$(date +%s)
-          ollama pull "$JUDGE_MODEL" \
+          ollama pull '${{ steps.judge.outputs.model }}' \
             2>&1 | tee "$RESULTS_DIR/judge-model-pull.log"
           completed=$(date +%s)
           jq -n \
-            --arg model "$JUDGE_MODEL" \
+            --arg model '${{ steps.judge.outputs.model }}' \
             --argjson duration_seconds "$((completed - started))" \
             '{model: $model, duration_seconds: $duration_seconds}' \
             > "$RESULTS_DIR/judge-model-pull-timing.json"
 
       - name: Evaluate with DeepEval
         id: evaluation
-        if: steps.response_validation.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
@@ -153,10 +247,10 @@ jobs:
             --goldens dataset/golden_dataset.json \
             --output-dir "$RESULTS_DIR" \
             --response-model "$MODEL_BRANCH" \
-            --judge-model "$JUDGE_MODEL" \
+            --judge-model '${{ steps.judge.outputs.model }}' \
             --expected-count 10 \
             --threshold 0.5 \
-            --identifier "$MODEL_BRANCH-phi-judge-pr-${{ github.event.pull_request.number }}" \
+            --identifier "$MODEL_BRANCH-${{ steps.judge.outputs.slug }}-judge-pr-${{ github.event.pull_request.number }}" \
             2>&1 | tee "$RESULTS_DIR/deepeval-console.log"
 
       - name: Add evaluation report to workflow summary
@@ -166,7 +260,7 @@ jobs:
             cat "$RESULTS_DIR/evaluation-report.md" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload responses, metrics, and all logs
+      - name: Upload evaluation results and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -175,14 +269,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Enforce complete generation and evaluation
+      - name: Enforce successful evaluation
         if: always()
         env:
-          GENERATION_OUTCOME: ${{ steps.generation.outcome }}
-          RESPONSE_VALIDATION_OUTCOME: ${{ steps.response_validation.outcome }}
           EVALUATION_OUTCOME: ${{ steps.evaluation.outcome }}
         run: |
-          if [[ "$GENERATION_OUTCOME" != "success" || "$RESPONSE_VALIDATION_OUTCOME" != "success" || "$EVALUATION_OUTCOME" != "success" ]]; then
-            echo "Response generation, validation, or DeepEval judging failed." >&2
+          if [[ "$EVALUATION_OUTCOME" != "success" ]]; then
+            echo "DeepEval judging failed." >&2
             exit 1
           fi
