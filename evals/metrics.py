@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from deepeval.metrics import (
     AnswerRelevancyMetric,
     ContextualRecallMetric,
@@ -18,13 +20,15 @@ def build_metrics(
     base_url: str,
     threshold: float,
 ):
+    judge_num_ctx = int(os.environ.get("DEEPEVAL_JUDGE_NUM_CTX", "4096"))
+    judge_num_predict = int(os.environ.get("DEEPEVAL_JUDGE_NUM_PREDICT", "256"))
     judge_model = OllamaModel(
         model=judge_model_name,
         base_url=base_url,
         temperature=0.0,
         generation_kwargs={
-            "num_ctx": 16384,
-            "num_predict": 1024,
+            "num_ctx": judge_num_ctx,
+            "num_predict": judge_num_predict,
             "seed": 42,
         },
     )
@@ -33,7 +37,7 @@ def build_metrics(
         "threshold": threshold,
         "include_reason": True,
         "async_mode": False,
-        "verbose_mode": True,
+        "verbose_mode": False,
     }
     return [
         FaithfulnessMetric(**common_options),
