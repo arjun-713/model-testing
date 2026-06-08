@@ -65,7 +65,7 @@ python runners/run_responses.py \
 For Gemma 4 through Hugging Face Transformers:
 
 ```bash
-python -m pip install -U transformers torch accelerate sentencepiece
+python -m pip install -U transformers torch accelerate sentencepiece pillow
 python runners/run_responses.py \
   --model google/gemma-4-E4B-it \
   --model-name gemma \

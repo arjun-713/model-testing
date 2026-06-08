@@ -60,7 +60,7 @@ jobs:
       - name: Install Hugging Face runtime
         if: steps.model.outputs.provider == 'huggingface'
         run: |
-          python -m pip install -U transformers torch accelerate sentencepiece \
+          python -m pip install -U transformers torch accelerate sentencepiece pillow \
             2>&1 | tee "$RESULTS_DIR/huggingface-install.log"
 
       - name: Install Ollama

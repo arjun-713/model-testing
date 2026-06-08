@@ -138,7 +138,7 @@ def load_huggingface_backend(model_id: str) -> tuple[Any, Any, Any]:
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "Hugging Face runtime is not installed. Install transformers, torch, "
-            "accelerate, and sentencepiece before using provider=huggingface."
+            "accelerate, sentencepiece, and pillow before using provider=huggingface."
         ) from exc
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
