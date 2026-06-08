@@ -134,7 +134,7 @@ def post_ollama_chat(
 def load_huggingface_backend(model_id: str) -> tuple[Any, Any, Any]:
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoProcessor
+        from transformers import AutoModelForCausalLM, AutoTokenizer
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "Hugging Face runtime is not installed. Install transformers, torch, "
@@ -142,7 +142,7 @@ def load_huggingface_backend(model_id: str) -> tuple[Any, Any, Any]:
         ) from exc
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-    processor = AutoProcessor.from_pretrained(model_id, token=token)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         dtype="auto",
@@ -150,12 +150,12 @@ def load_huggingface_backend(model_id: str) -> tuple[Any, Any, Any]:
         token=token,
         low_cpu_mem_usage=True,
     )
-    return processor, model, torch
+    return tokenizer, model, torch
 
 
 def post_huggingface_chat(
     *,
-    processor: Any,
+    tokenizer: Any,
     model: Any,
     torch_module: Any,
     prompt: str,
@@ -166,13 +166,13 @@ def post_huggingface_chat(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
-    text = processor.apply_chat_template(
+    text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
         enable_thinking=False,
     )
-    inputs = processor(text=text, return_tensors="pt")
+    inputs = tokenizer(text, return_tensors="pt")
     if hasattr(inputs, "to"):
         inputs = inputs.to(model.device)
     input_len = inputs["input_ids"].shape[-1]
@@ -187,7 +187,7 @@ def post_huggingface_chat(
             do_sample=temperature > 0,
             temperature=max(temperature, 1e-5),
         )
-    output = processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+    output = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
     return {
         "message": {"content": output},
         "done": True,
@@ -222,9 +222,9 @@ def generate_response(
     if provider == "huggingface":
         if huggingface_backend is None:
             raise RuntimeError("Hugging Face backend was not initialized.")
-        processor, hf_model, torch_module = huggingface_backend
+        tokenizer, hf_model, torch_module = huggingface_backend
         return post_huggingface_chat(
-            processor=processor,
+            tokenizer=tokenizer,
             model=hf_model,
             torch_module=torch_module,
             prompt=prompt,
