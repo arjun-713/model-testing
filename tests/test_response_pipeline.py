@@ -7,11 +7,18 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from runners.run_responses import run
+from runners.run_responses import SYSTEM_PROMPT, run
 from runners.validate_responses import validate_entries
 
 
 class ResponsePipelineTests(unittest.TestCase):
+    def test_runner_uses_repo_system_prompt(self) -> None:
+        self.assertIn("You are JenkinsBot", SYSTEM_PROMPT)
+        self.assertIn(
+            "\"I'm not able to answer based on the available information.\"",
+            SYSTEM_PROMPT,
+        )
+
     def test_validator_rejects_blank_outputs(self) -> None:
         errors = validate_entries(
             [{"id": "q-001", "actual_output": ""}], expected_count=1
@@ -42,11 +49,13 @@ class ResponsePipelineTests(unittest.TestCase):
             args = argparse.Namespace(
                 model="test-model:latest",
                 model_name="test-model",
+                provider="ollama",
                 input=input_file,
                 output_dir=output_dir,
                 limit=2,
                 max_tokens=512,
                 num_ctx=4096,
+                temperature=0.1,
                 base_url="http://127.0.0.1:11434",
                 request_timeout=5.0,
                 retries=0,
@@ -66,7 +75,9 @@ class ResponsePipelineTests(unittest.TestCase):
                     "prompt_eval_count": 10,
                 },
             ]
-            with patch("runners.run_responses.post_chat", side_effect=responses):
+            with patch(
+                "runners.run_responses.generate_response", side_effect=responses
+            ):
                 result = run(args)
 
             self.assertEqual(result, 0)
@@ -103,11 +114,13 @@ class ResponsePipelineTests(unittest.TestCase):
             args = argparse.Namespace(
                 model="test-model:latest",
                 model_name="test-model",
+                provider="ollama",
                 input=input_file,
                 output_dir=output_dir,
                 limit=1,
                 max_tokens=512,
                 num_ctx=4096,
+                temperature=0.1,
                 base_url="http://127.0.0.1:11434",
                 request_timeout=5.0,
                 retries=0,
@@ -119,7 +132,9 @@ class ResponsePipelineTests(unittest.TestCase):
                 "eval_count": 0,
                 "prompt_eval_count": 10,
             }
-            with patch("runners.run_responses.post_chat", return_value=response):
+            with patch(
+                "runners.run_responses.generate_response", return_value=response
+            ):
                 result = run(args)
 
             self.assertEqual(result, 1)
@@ -128,6 +143,60 @@ class ResponsePipelineTests(unittest.TestCase):
             )
             self.assertEqual(summary["filled_count"], 0)
             self.assertEqual(summary["failed_ids"], ["q-001"])
+
+    def test_runner_loads_huggingface_backend_once(self) -> None:
+        source = [
+            {
+                "id": "q-001",
+                "input": "Question?",
+                "actual_output": "",
+                "retrieval_context": ["Context."],
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            input_file = root / "responses.json"
+            output_dir = root / "results"
+            input_file.write_text(json.dumps(source), encoding="utf-8")
+            args = argparse.Namespace(
+                model="google/gemma-4-E4B-it",
+                model_name="gemma",
+                provider="huggingface",
+                input=input_file,
+                output_dir=output_dir,
+                limit=1,
+                max_tokens=512,
+                num_ctx=4096,
+                temperature=0.1,
+                base_url="http://127.0.0.1:11434",
+                request_timeout=5.0,
+                retries=0,
+            )
+
+            response = {
+                "message": {"content": "Answer from hf."},
+                "done": True,
+                "eval_count": 5,
+                "prompt_eval_count": 12,
+                "provider": "huggingface",
+            }
+            with patch(
+                "runners.run_responses.load_huggingface_backend",
+                return_value=("processor", "model", "torch"),
+            ) as load_backend:
+                with patch(
+                    "runners.run_responses.generate_response", return_value=response
+                ) as generate:
+                    result = run(args)
+
+            self.assertEqual(result, 0)
+            load_backend.assert_called_once_with("google/gemma-4-E4B-it")
+            self.assertEqual(generate.call_count, 1)
+            summary = json.loads(
+                (output_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["provider"], "huggingface")
 
 
 if __name__ == "__main__":

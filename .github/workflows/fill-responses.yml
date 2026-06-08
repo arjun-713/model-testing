@@ -36,31 +36,42 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RESULTS_DIR"
-          model=$(jq -r --arg branch "$MODEL_BRANCH" '.[$branch].ollama_model // empty' configs/models.json)
+          provider=$(jq -r --arg branch "$MODEL_BRANCH" '.[$branch].provider // "ollama"' configs/models.json)
+          model=$(jq -r --arg branch "$MODEL_BRANCH" '.[$branch].model_id // .[$branch].ollama_model // empty' configs/models.json)
           display_name=$(jq -r --arg branch "$MODEL_BRANCH" '.[$branch].display_name // empty' configs/models.json)
-          if [[ -z "$model" || -z "$display_name" ]]; then
+          if [[ -z "$provider" || -z "$model" || -z "$display_name" ]]; then
             echo "No model is configured for branch: $MODEL_BRANCH" >&2
             exit 1
           fi
+          echo "provider=$provider" >> "$GITHUB_OUTPUT"
           echo "model=$model" >> "$GITHUB_OUTPUT"
           echo "display_name=$display_name" >> "$GITHUB_OUTPUT"
           jq -n \
             --arg branch "$MODEL_BRANCH" \
+            --arg provider "$provider" \
             --arg model "$model" \
             --arg display_name "$display_name" \
-            '{branch: $branch, model: $model, display_name: $display_name}' \
+            '{branch: $branch, provider: $provider, model: $model, display_name: $display_name}' \
             > "$RESULTS_DIR/model.json"
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
+      - name: Install Hugging Face runtime
+        if: steps.model.outputs.provider == 'huggingface'
+        run: |
+          python -m pip install -U transformers torch accelerate sentencepiece \
+            2>&1 | tee "$RESULTS_DIR/huggingface-install.log"
+
       - name: Install Ollama
+        if: steps.model.outputs.provider == 'ollama'
         shell: bash
         run: |
           curl -fsSL https://ollama.com/install.sh -o /tmp/install-ollama.sh
           sh /tmp/install-ollama.sh 2>&1 | tee "$RESULTS_DIR/ollama-install.log"
 
       - name: Start Ollama
+        if: steps.model.outputs.provider == 'ollama'
         shell: bash
         run: |
           nohup ollama serve > "$RESULTS_DIR/ollama-server.log" 2>&1 &
@@ -75,6 +86,7 @@ jobs:
           exit 1
 
       - name: Pull ${{ steps.model.outputs.display_name }}
+        if: steps.model.outputs.provider == 'ollama'
         shell: bash
         run: |
           started=$(date +%s)
@@ -94,10 +106,12 @@ jobs:
           python runners/run_responses.py \
             --model '${{ steps.model.outputs.model }}' \
             --model-name "$MODEL_BRANCH" \
+            --provider '${{ steps.model.outputs.provider }}' \
             --input dataset/responses.json \
             --output-dir "$RESULTS_DIR" \
             --limit 10 \
             --max-tokens 512 \
+            --temperature 0.1 \
             --num-ctx 16384 \
             2>&1 | tee "$RESULTS_DIR/runner-console.log"
 

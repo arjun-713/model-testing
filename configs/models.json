@@ -1,14 +1,17 @@
 {
   "qwen": {
     "display_name": "Qwen3 4B Instruct",
+    "provider": "ollama",
     "ollama_model": "qwen3:4b-instruct"
   },
   "gemma": {
-    "display_name": "Gemma 3n E4B",
-    "ollama_model": "gemma3n:e4b"
+    "display_name": "Gemma 4 E4B IT",
+    "provider": "huggingface",
+    "model_id": "google/gemma-4-E4B-it"
   },
   "phi": {
     "display_name": "Phi-4 Mini Instruct",
+    "provider": "ollama",
     "ollama_model": "phi4-mini"
   }
 }

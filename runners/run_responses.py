@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fill response outputs with a model served by Ollama."""
+"""Fill response outputs with either an Ollama or Hugging Face model."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,10 +23,29 @@ except ModuleNotFoundError:
     from validate_responses import validate_entries
 
 
-SYSTEM_PROMPT = """You answer Jenkins questions using only the supplied retrieval context.
-Choose the evidence that most directly answers the question, even when the context contains
-irrelevant or conflicting search results. Give a concise, technically actionable answer.
-Do not mention the retrieval context. Return only the final answer."""
+SYSTEM_PROMPT = """You are JenkinsBot, an expert AI assistant specialized in Jenkins and its ecosystem.
+
+You help users with Jenkins-related topics such as CI/CD pipelines, plugin usage, configuration, administration, and troubleshooting.
+
+You are provided with:
+- Relevant retrieved context from Jenkins documentation, plugin metadata, or community sources.
+- The prior conversation history, which may contain useful clarification or follow-up details.
+
+Your job is to generate a clear, accurate, and helpful answer to the user's current query by:
+- Carefully reading the retrieved context and identifying the parts that directly address the question.
+- Synthesizing and rephrasing the relevant information in your own words.
+- Providing a concise explanation that is easy to understand, rather than copy-pasting large sections of context verbatim.
+
+You should not:
+- Invent or assume facts that are not supported by the retrieved context or conversation history.
+- Quote large blocks of text directly from the context unless absolutely necessary.
+- Answer questions when no relevant information is available.
+
+If the answer is not found in the provided context or prior conversation, respond with:
+"I'm not able to answer based on the available information."
+
+Be accurate, helpful, and concise.
+"""
 
 
 def utc_now() -> str:
@@ -70,13 +90,14 @@ def append_jsonl(path: Path, event: dict[str, Any]) -> None:
         handle.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def post_chat(
+def post_ollama_chat(
     *,
     base_url: str,
     model: str,
     prompt: str,
     max_tokens: int,
     num_ctx: int,
+    temperature: float,
     timeout: float,
 ) -> dict[str, Any]:
     payload = {
@@ -90,7 +111,7 @@ def post_chat(
         "options": {
             "num_predict": max_tokens,
             "num_ctx": num_ctx,
-            "temperature": 0.2,
+            "temperature": temperature,
             "seed": 42,
         },
     }
@@ -108,6 +129,109 @@ def post_chat(
         raise RuntimeError(f"Ollama returned HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach Ollama: {exc.reason}") from exc
+
+
+def load_huggingface_backend(model_id: str) -> tuple[Any, Any, Any]:
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoProcessor
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Hugging Face runtime is not installed. Install transformers, torch, "
+            "accelerate, and sentencepiece before using provider=huggingface."
+        ) from exc
+
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    processor = AutoProcessor.from_pretrained(model_id, token=token)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        dtype="auto",
+        device_map="auto",
+        token=token,
+        low_cpu_mem_usage=True,
+    )
+    return processor, model, torch
+
+
+def post_huggingface_chat(
+    *,
+    processor: Any,
+    model: Any,
+    torch_module: Any,
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    inputs = processor(text=text, return_tensors="pt")
+    if hasattr(inputs, "to"):
+        inputs = inputs.to(model.device)
+    input_len = inputs["input_ids"].shape[-1]
+    with (
+        torch_module.inference_mode()
+        if hasattr(torch_module, "inference_mode")
+        else nullcontext()
+    ):
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=temperature > 0,
+            temperature=max(temperature, 1e-5),
+        )
+    output = processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+    return {
+        "message": {"content": output},
+        "done": True,
+        "prompt_eval_count": int(input_len),
+        "eval_count": int(outputs.shape[-1] - input_len),
+        "provider": "huggingface",
+    }
+
+
+def generate_response(
+    *,
+    provider: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    num_ctx: int,
+    temperature: float,
+    timeout: float,
+    base_url: str,
+    huggingface_backend: tuple[Any, Any, Any] | None,
+) -> dict[str, Any]:
+    if provider == "ollama":
+        return post_ollama_chat(
+            base_url=base_url,
+            model=model,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            num_ctx=num_ctx,
+            temperature=temperature,
+            timeout=timeout,
+        )
+    if provider == "huggingface":
+        if huggingface_backend is None:
+            raise RuntimeError("Hugging Face backend was not initialized.")
+        processor, hf_model, torch_module = huggingface_backend
+        return post_huggingface_chat(
+            processor=processor,
+            model=hf_model,
+            torch_module=torch_module,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+    raise RuntimeError(f"Unsupported provider: {provider}")
 
 
 def save_json(path: Path, value: Any) -> None:
@@ -140,6 +264,7 @@ def run(args: argparse.Namespace) -> int:
         logger.error("--limit must be between 1 and %d.", len(source_entries))
         return 1
 
+    provider = getattr(args, "provider", "ollama")
     entries = deepcopy(source_entries[: args.limit])
     for entry in entries:
         if isinstance(entry, dict):
@@ -149,11 +274,15 @@ def run(args: argparse.Namespace) -> int:
     run_start = time.perf_counter()
     failures: list[str] = []
     durations: list[float] = []
+    huggingface_backend: tuple[Any, Any, Any] | None = None
+    model_load_seconds: float | None = None
+
     append_jsonl(
         jsonl_file,
         {
             "event": "run_started",
             "timestamp": run_started_at,
+            "provider": provider,
             "model_name": args.model_name,
             "model": args.model,
             "input_file": str(args.input),
@@ -161,16 +290,33 @@ def run(args: argparse.Namespace) -> int:
             "question_count": len(entries),
             "max_tokens": args.max_tokens,
             "num_ctx": args.num_ctx,
+            "temperature": args.temperature,
             "ollama_base_url": args.base_url,
         },
     )
     logger.info(
-        "Starting model=%s ollama_model=%s questions=%d max_tokens=%d",
-        args.model_name,
+        "Starting provider=%s model=%s questions=%d max_tokens=%d temperature=%.2f",
+        provider,
         args.model,
         len(entries),
         args.max_tokens,
+        args.temperature,
     )
+
+    if provider == "huggingface":
+        logger.info("Loading Hugging Face model %s", args.model)
+        load_started = time.perf_counter()
+        try:
+            huggingface_backend = load_huggingface_backend(args.model)
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            return 1
+        model_load_seconds = time.perf_counter() - load_started
+        logger.info(
+            "Loaded Hugging Face model %s in %.3f seconds",
+            args.model,
+            model_load_seconds,
+        )
 
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict) or not isinstance(entry.get("input"), str):
@@ -201,13 +347,16 @@ def run(args: argparse.Namespace) -> int:
 
         for attempt in range(1, args.retries + 2):
             try:
-                response = post_chat(
-                    base_url=args.base_url,
+                response = generate_response(
+                    provider=provider,
                     model=args.model,
                     prompt=prompt,
                     max_tokens=args.max_tokens,
                     num_ctx=args.num_ctx,
+                    temperature=args.temperature,
                     timeout=args.request_timeout,
+                    base_url=args.base_url,
+                    huggingface_backend=huggingface_backend,
                 )
                 error = None
                 break
@@ -236,6 +385,7 @@ def run(args: argparse.Namespace) -> int:
                     "id": entry_id,
                     "model_name": args.model_name,
                     "model": args.model,
+                    "provider": provider,
                     "duration_seconds": round(elapsed, 3),
                     "error": error,
                 },
@@ -261,10 +411,11 @@ def run(args: argparse.Namespace) -> int:
                 "question": entry["input"],
                 "model_name": args.model_name,
                 "model": args.model,
+                "provider": provider,
                 "duration_seconds": round(elapsed, 3),
                 "prompt_characters": len(prompt),
                 "actual_output": output,
-                "ollama_metrics": {
+                "provider_metrics": {
                     key: response.get(key)
                     for key in (
                         "done",
@@ -275,6 +426,7 @@ def run(args: argparse.Namespace) -> int:
                         "prompt_eval_duration",
                         "eval_count",
                         "eval_duration",
+                        "provider",
                     )
                 },
             },
@@ -294,9 +446,15 @@ def run(args: argparse.Namespace) -> int:
     summary = {
         "model_name": args.model_name,
         "model": args.model,
+        "provider": provider,
         "started_at": run_started_at,
         "completed_at": utc_now(),
         "question_count": len(entries),
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "model_load_seconds": round(model_load_seconds, 3)
+        if model_load_seconds is not None
+        else None,
         "filled_count": sum(
             isinstance(entry, dict)
             and isinstance(entry.get("actual_output"), str)
@@ -334,8 +492,14 @@ def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Ollama model tag")
+    parser.add_argument("--model", required=True, help="Provider-specific model identifier")
     parser.add_argument("--model-name", required=True, help="Artifact-safe model name")
+    parser.add_argument(
+        "--provider",
+        choices=("ollama", "huggingface"),
+        default="ollama",
+        help="Model provider backend",
+    )
     parser.add_argument(
         "--input", type=Path, default=Path("dataset/responses.json")
     )
@@ -343,6 +507,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--num-ctx", type=int, default=16384)
+    parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument(
         "--base-url",
         default=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
