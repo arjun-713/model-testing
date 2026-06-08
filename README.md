@@ -40,6 +40,7 @@ The artifact contains:
 - `ollama-server.log`: local model-server logs for Ollama-backed models
 - `validation.log`: final output validation result
 
+
 ## Local checks
 
 Run its tests with:
