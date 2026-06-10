@@ -1,5 +1,5 @@
 {
-  "question_count": 10,
+  "question_count": 50,
   "shard_size": 10,
   "max_parallel": 5,
   "response_model": "qwen3:4b-instruct",
