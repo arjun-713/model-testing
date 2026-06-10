@@ -1,72 +1,109 @@
-name: Generate and judge responses
+name: Qwen responses with Gemma DeepEval judge
 
 "on":
   pull_request:
     branches:
-      - qwen
-      - gemma
-      - phi
+      - qwen-gemma-tr1
+  workflow_dispatch:
+    inputs:
+      question_count:
+        description: Number of questions to generate and evaluate
+        required: false
+        default: "10"
 
 permissions:
   contents: read
 
 concurrency:
-  group: generate-judge-${{ github.event.pull_request.number }}-${{ github.base_ref }}
+  group: qwen-gemma-tr1-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
-  generate-and-judge:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      question_count: ${{ steps.plan.outputs.question_count }}
+      shard_count: ${{ steps.plan.outputs.shard_count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build shard matrix
+        id: plan
+        shell: bash
+        run: |
+          requested='${{ inputs.question_count }}'
+          if [[ -z "$requested" ]]; then
+            requested='${{ vars.EVAL_QUESTION_COUNT }}'
+          fi
+          if [[ -z "$requested" ]]; then
+            requested=$(jq -r '.question_count' configs/evaluation.json)
+          fi
+          shard_size=$(jq -r '.shard_size' configs/evaluation.json)
+          python scripts/build_shard_matrix.py \
+            --dataset dataset/responses.json \
+            --question-count "$requested" \
+            --shard-size "$shard_size" \
+            --github-output "$GITHUB_OUTPUT"
+
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-eval.txt
+      - run: python -m pip install -r requirements-eval.txt
+      - run: python -m unittest discover -s tests -v
+
+  generate-and-evaluate:
+    needs: [prepare, tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      MODEL_BRANCH: ${{ github.base_ref }}
-      RESULTS_DIR: results/${{ github.base_ref }}
-      JUDGE_MODEL: qwen3:4b-instruct
+      RESULTS_DIR: results/shard-${{ matrix.shard }}
+      RESPONSE_MODEL: qwen3:4b-instruct
+      JUDGE_MODEL: gemma3:4b-it-qat
       CONFIDENT_API_KEY: ${{ secrets.CONFIDENT_API_KEY }}
       DEEPEVAL_DISABLE_DOTENV: "1"
       DEEPEVAL_TELEMETRY_OPT_OUT: "1"
+      DEEPEVAL_PER_TASK_TIMEOUT_SECONDS_OVERRIDE: "900"
+      DEEPEVAL_JUDGE_NUM_CTX: "16384"
+      DEEPEVAL_JUDGE_NUM_PREDICT: "1024"
 
     steps:
-      - name: Check out pull request
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-eval.txt
 
-      - name: Resolve response model
-        id: model
+      - name: Initialize shard logs
         shell: bash
         run: |
           mkdir -p "$RESULTS_DIR"
-          model=$(jq -r --arg branch "$MODEL_BRANCH" '.[$branch].ollama_model // empty' configs/models.json)
-          display_name=$(jq -r --arg branch "$MODEL_BRANCH" '.[$branch].display_name // empty' configs/models.json)
-          if [[ -z "$model" || -z "$display_name" ]]; then
-            echo "No model is configured for branch: $MODEL_BRANCH" >&2
-            exit 1
-          fi
-          echo "model=$model" >> "$GITHUB_OUTPUT"
-          echo "display_name=$display_name" >> "$GITHUB_OUTPUT"
           jq -n \
-            --arg branch "$MODEL_BRANCH" \
-            --arg model "$model" \
-            --arg display_name "$display_name" \
+            --argjson shard '${{ matrix.shard }}' \
+            --argjson offset '${{ matrix.offset }}' \
+            --argjson limit '${{ matrix.limit }}' \
+            --arg response_model "$RESPONSE_MODEL" \
             --arg judge_model "$JUDGE_MODEL" \
-            '{branch: $branch, response_model: $model, display_name: $display_name, judge_model: $judge_model}' \
-            > "$RESULTS_DIR/models.json"
+            '{shard: $shard, offset: $offset, limit: $limit, response_model: $response_model, judge_model: $judge_model}' \
+            > "$RESULTS_DIR/shard.json"
 
       - name: Install DeepEval
         run: |
           python -m pip install -r requirements-eval.txt \
             2>&1 | tee "$RESULTS_DIR/dependency-install.log"
-
-      - name: Run unit tests
-        run: |
-          python -m unittest discover -s tests -v \
-            2>&1 | tee "$RESULTS_DIR/unit-tests.log"
 
       - name: Install Ollama
         shell: bash
@@ -79,7 +116,6 @@ jobs:
         shell: bash
         run: |
           nohup ollama serve > "$RESULTS_DIR/ollama-server.log" 2>&1 &
-          echo $! > "$RESULTS_DIR/ollama-server.pid"
           for attempt in {1..30}; do
             if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
               exit 0
@@ -89,100 +125,134 @@ jobs:
           echo "Ollama did not become ready within 60 seconds." >&2
           exit 1
 
-      - name: Pull response model
+      - name: Pull quantized response and judge models
         shell: bash
         run: |
           started=$(date +%s)
-          ollama pull '${{ steps.model.outputs.model }}' \
+          ollama pull "$RESPONSE_MODEL" \
             2>&1 | tee "$RESULTS_DIR/response-model-pull.log"
-          completed=$(date +%s)
+          response_completed=$(date +%s)
+          ollama pull "$JUDGE_MODEL" \
+            2>&1 | tee "$RESULTS_DIR/judge-model-pull.log"
+          judge_completed=$(date +%s)
           jq -n \
-            --arg model '${{ steps.model.outputs.model }}' \
-            --argjson duration_seconds "$((completed - started))" \
-            '{model: $model, duration_seconds: $duration_seconds}' \
-            > "$RESULTS_DIR/response-model-pull-timing.json"
+            --arg response_model "$RESPONSE_MODEL" \
+            --arg judge_model "$JUDGE_MODEL" \
+            --argjson response_seconds "$((response_completed - started))" \
+            --argjson judge_seconds "$((judge_completed - response_completed))" \
+            '{response_model: $response_model, judge_model: $judge_model, response_pull_seconds: $response_seconds, judge_pull_seconds: $judge_seconds}' \
+            > "$RESULTS_DIR/model-pull-timing.json"
 
-      - name: Fill 10 actual_output fields
+      - name: Generate shard responses
         id: generation
         continue-on-error: true
         shell: bash
         run: |
           python runners/run_responses.py \
-            --model '${{ steps.model.outputs.model }}' \
-            --model-name "$MODEL_BRANCH" \
+            --model "$RESPONSE_MODEL" \
+            --model-name qwen \
             --input dataset/responses.json \
             --output-dir "$RESULTS_DIR" \
-            --limit 10 \
+            --offset '${{ matrix.offset }}' \
+            --limit '${{ matrix.limit }}' \
             --max-tokens 256 \
             --temperature 0.1 \
             --num-ctx 16384 \
             2>&1 | tee "$RESULTS_DIR/response-generation-console.log"
 
-      - name: Validate generated responses
-        id: response_validation
+      - name: Validate shard responses
+        id: validation
         if: always()
         continue-on-error: true
         run: |
           python runners/validate_responses.py \
             "$RESULTS_DIR/responses.json" \
-            --expected-count 10 \
+            --expected-count '${{ matrix.limit }}' \
             2>&1 | tee "$RESULTS_DIR/response-validation.log"
 
-      - name: Pull Qwen judge model
-        if: steps.response_validation.outcome == 'success'
-        shell: bash
-        run: |
-          started=$(date +%s)
-          ollama pull "$JUDGE_MODEL" \
-            2>&1 | tee "$RESULTS_DIR/judge-model-pull.log"
-          completed=$(date +%s)
-          jq -n \
-            --arg model "$JUDGE_MODEL" \
-            --argjson duration_seconds "$((completed - started))" \
-            '{model: $model, duration_seconds: $duration_seconds}' \
-            > "$RESULTS_DIR/judge-model-pull-timing.json"
-
-      - name: Evaluate with DeepEval
+      - name: Evaluate shard immediately with Gemma
         id: evaluation
-        if: steps.response_validation.outcome == 'success'
+        if: steps.validation.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
-          python evals/run_evaluation.py \
+          python -m evals.run_evaluation \
             --responses "$RESULTS_DIR/responses.json" \
             --goldens dataset/golden_dataset.json \
             --output-dir "$RESULTS_DIR" \
-            --response-model "$MODEL_BRANCH" \
+            --response-model "$RESPONSE_MODEL" \
             --judge-model "$JUDGE_MODEL" \
-            --expected-count 10 \
+            --expected-count '${{ matrix.limit }}' \
             --threshold 0.5 \
-            --identifier "$MODEL_BRANCH-qwen-judge-pr-${{ github.event.pull_request.number }}" \
+            --identifier "qwen-gemma-tr1-${{ github.run_id }}-shard-${{ matrix.shard }}" \
             2>&1 | tee "$RESULTS_DIR/deepeval-console.log"
 
-      - name: Add evaluation report to workflow summary
-        if: always()
-        run: |
-          if [[ -f "$RESULTS_DIR/evaluation-report.md" ]]; then
-            cat "$RESULTS_DIR/evaluation-report.md" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Upload responses, metrics, and all logs
+      - name: Upload shard responses, metrics, and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: deepeval-${{ github.base_ref }}-${{ github.run_id }}
+          name: shard-${{ matrix.shard }}
           path: ${{ env.RESULTS_DIR }}/
           if-no-files-found: error
           retention-days: 14
 
-      - name: Enforce complete generation and evaluation
+      - name: Enforce complete shard
         if: always()
         env:
           GENERATION_OUTCOME: ${{ steps.generation.outcome }}
-          RESPONSE_VALIDATION_OUTCOME: ${{ steps.response_validation.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
           EVALUATION_OUTCOME: ${{ steps.evaluation.outcome }}
         run: |
-          if [[ "$GENERATION_OUTCOME" != "success" || "$RESPONSE_VALIDATION_OUTCOME" != "success" || "$EVALUATION_OUTCOME" != "success" ]]; then
-            echo "Response generation, validation, or DeepEval judging failed." >&2
+          if [[ "$GENERATION_OUTCOME" != "success" || "$VALIDATION_OUTCOME" != "success" || "$EVALUATION_OUTCOME" != "success" ]]; then
+            echo "Shard generation, validation, or evaluation failed." >&2
             exit 1
           fi
+
+  aggregate:
+    if: always()
+    needs: [prepare, generate-and-evaluate]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all completed shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: artifacts
+
+      - name: Aggregate responses and metric scores
+        id: aggregate
+        continue-on-error: true
+        run: |
+          python -m evals.aggregate_results \
+            --artifact-dir artifacts \
+            --dataset dataset/responses.json \
+            --question-count '${{ needs.prepare.outputs.question_count }}' \
+            --expected-shards '${{ needs.prepare.outputs.shard_count }}' \
+            --output-dir aggregate
+
+      - name: Publish aggregate report
+        if: always()
+        run: |
+          if [[ -f aggregate/evaluation-report.md ]]; then
+            cat aggregate/evaluation-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload aggregate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-gemma-tr1-report-${{ github.run_id }}
+          path: aggregate/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce successful aggregation
+        if: always()
+        env:
+          AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
+        run: |
+          if [[ "$AGGREGATE_OUTCOME" != "success" ]]; then
+            echo "The final aggregate report is incomplete." >&2
+            exit 1

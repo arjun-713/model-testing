@@ -1,72 +1,59 @@
-# Model response testing
+# Qwen response testing with a Gemma judge
 
-This repository fills `actual_output` fields from a question and its
-`retrieval_context`, then evaluates the generated answers with DeepEval.
+This branch runs one fixed evaluation combination:
 
-## Model branches
+- Response model: `qwen3:4b-instruct` (`Q4_K_M`)
+- Judge model: `gemma3:4b-it-qat` (quantization-aware trained)
+- Metrics: Faithfulness, Answer Relevancy, and Contextual Recall
 
-Pull requests trigger response generation only when their base branch is one
-of the model branches below. The exact Ollama tags are defined in
-`configs/models.json`.
+## Question count and sharding
 
-| Base branch | Response model | Ollama tag |
-| --- | --- | --- |
-| `qwen` | Qwen3 4B Instruct | `qwen3:4b-instruct` |
-| `gemma` | Gemma 3n E4B | `gemma3n:e4b` |
-| `phi` | Phi-4 Mini Instruct | `phi4-mini` |
+The default question count and shard size are defined in
+`configs/evaluation.json`. Pull request runs use that default unless the
+repository variable `EVAL_QUESTION_COUNT` is set. A manual workflow run can
+override it with the optional `question_count` input.
 
-To test a model, create a small change on a separate branch and open a pull
-request whose base branch is the model branch. A pull request targeting `main`
-does not run the model workflow.
+Questions are divided into shards of 10. Each matrix job generates its shard
+with Qwen and immediately starts DeepEval with Gemma. Other shards continue in
+parallel. After every shard finishes, the aggregate job combines responses,
+per-question scores, weighted metric averages, timings, and errors into one
+report.
 
-## CI behavior
+Examples:
 
-The workflow uses the first 10 entries from `dataset/responses.json`. The
-response model generates answers with a 256-token cap and temperature 0.1.
-DeepEval then uses `qwen3:4b-instruct` through Ollama at temperature 0.0 to
-measure Faithfulness, Answer Relevancy, and Contextual Recall.
+- `10` questions creates one shard.
+- `25` questions creates shards of 10, 10, and 5.
+- `50` questions creates five parallel shards of 10.
 
-Expected outputs are joined from `dataset/golden_dataset.json` by question ID
-for Contextual Recall. The committed datasets are not modified.
+## Sampling parameters
 
-The job passes only when all 10 outputs and all 30 metric scores are present.
-Metric scores below the 0.5 threshold are reported but do not fail CI. Logs and
-partial results are uploaded even when generation or evaluation fails.
+| Setting | Response model | Judge model |
+| --- | ---: | ---: |
+| Temperature | 0.1 | 0.0 |
+| Maximum output tokens | 256 | 1024 |
+| Context window | 16384 | 16384 |
+| Seed | 42 | 42 |
 
-The artifact contains:
+The larger judge output limit prevents DeepEval JSON and metric reasons from
+being cut off. Metric threshold is `0.5`; a low score is reported, while a
+missing or invalid score fails the shard and final aggregation.
 
-- `responses.json`: the 10 questions with generated outputs
-- `summary.json`: response-generation timing and failed IDs
-- `<model>.log`: readable per-question logs including generated answers
-- `<model>.jsonl`: structured timing, token counts, answers, and Ollama metrics
-- `deepeval-result.json`: raw DeepEval test and metric results
-- `evaluation-summary.json`: per-question and aggregate metric scores
-- `evaluation-report.md`: readable metric report and Confident AI link
-- `deepeval-console.log`: complete DeepEval and verbose judge logs
-- response and judge model pull logs and timings
-- `ollama-server.log`: local model-server logs
-- dependency, unit-test, and validation logs
+## Artifacts
 
-If the repository secret `CONFIDENT_API_KEY` is configured, DeepEval also
-publishes the test run to Confident AI. The local evaluation and GitHub artifact
-do not require that secret.
+Every shard uploads generated responses, generation timing, raw DeepEval
+results, metric summaries, model logs, and console logs. The final artifact
+contains:
 
-## Local checks
+- `responses.json`: all generated responses in dataset order
+- `evaluation-summary.json`: aggregate and per-question scores
+- `evaluation-report.md`: the readable final report
 
-The runner uses only the Python standard library. Run its tests with:
+## Local validation
 
 ```bash
 python -m unittest discover -s tests -v
-```
-
-When Ollama is already running locally, a response run can be started with:
-
-```bash
-python runners/run_responses.py \
-  --model qwen3:4b-instruct \
-  --model-name qwen \
-  --limit 10 \
-  --max-tokens 256 \
-  --temperature 0.1 \
-  --output-dir results/qwen
+python scripts/build_shard_matrix.py \
+  --dataset dataset/responses.json \
+  --question-count 50 \
+  --shard-size 10
 ```

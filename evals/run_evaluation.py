@@ -21,7 +21,8 @@ from deepeval.evaluate.configs import (
 )
 from deepeval.test_case import LLMTestCase
 
-from evals.metrics import METRIC_NAMES, build_metrics
+from evals.constants import METRIC_NAMES
+from evals.metrics import build_metrics
 
 
 def utc_now() -> str:
@@ -370,7 +371,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--response-model", required=True)
-    parser.add_argument("--judge-model", default="qwen3:4b-instruct")
+    parser.add_argument("--judge-model", default="gemma3:4b-it-qat")
     parser.add_argument("--expected-count", type=int, default=10)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(

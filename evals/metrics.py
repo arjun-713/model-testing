@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from deepeval.metrics import (
     AnswerRelevancyMetric,
     ContextualRecallMetric,
@@ -9,22 +11,22 @@ from deepeval.metrics import (
 )
 from deepeval.models import OllamaModel
 
-
-METRIC_NAMES = ("Faithfulness", "Answer Relevancy", "Contextual Recall")
-
+from evals.constants import METRIC_NAMES
 
 def build_metrics(
     judge_model_name: str,
     base_url: str,
     threshold: float,
 ):
+    judge_num_ctx = int(os.environ.get("DEEPEVAL_JUDGE_NUM_CTX", "16384"))
+    judge_num_predict = int(os.environ.get("DEEPEVAL_JUDGE_NUM_PREDICT", "1024"))
     judge_model = OllamaModel(
         model=judge_model_name,
         base_url=base_url,
         temperature=0.0,
         generation_kwargs={
-            "num_ctx": 16384,
-            "num_predict": 1024,
+            "num_ctx": judge_num_ctx,
+            "num_predict": judge_num_predict,
             "seed": 42,
         },
     )

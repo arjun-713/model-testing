@@ -16,12 +16,12 @@ class DeepEvalPipelineTests(unittest.TestCase):
         self.assertIn("deepeval==4.0.5", requirements)
         self.assertIn("ollama==0.6.2", requirements)
 
-    def test_build_metrics_uses_qwen_ollama_judge(self) -> None:
+    def test_build_metrics_uses_gemma_ollama_judge(self) -> None:
         if find_spec("ollama") is None:
             self.skipTest("Ollama Python client is installed by requirements-eval.txt")
 
         metrics = build_metrics(
-            "qwen3:4b-instruct",
+            "gemma3:4b-it-qat",
             "http://127.0.0.1:11434",
             0.5,
         )
@@ -37,7 +37,7 @@ class DeepEvalPipelineTests(unittest.TestCase):
         self.assertTrue(all(metric.threshold == 0.5 for metric in metrics))
         self.assertTrue(
             all(
-                metric.evaluation_model == "qwen3:4b-instruct (Ollama)"
+                metric.evaluation_model == "gemma3:4b-it-qat (Ollama)"
                 for metric in metrics
             )
         )
