@@ -10,6 +10,9 @@
   "judge_max_tokens": 2048,
   "judge_temperature": 0.0,
   "judge_num_ctx": 16384,
+  "include_reason": true,
   "seed": 42,
-  "metric_threshold": 0.5
+  "metric_threshold": 0.5,
+  "minimum_metric_coverage": 0.9,
+  "minimum_metric_pass_rate": 0.9
 }
