@@ -1,52 +1,65 @@
-# Qwen response testing with a Gemma judge
+# Qwen response testing with a Gemma QAT judge
 
-This branch runs one fixed evaluation combination:
+The evaluation workflow uses one fixed model combination:
 
 - Response model: `qwen3:4b-instruct` (`Q4_K_M`)
-- Judge model: `gemma3:4b-it-qat` (quantization-aware trained)
+- Judge model: `gemma3:4b-it-qat`
 - Metrics: Faithfulness, Answer Relevancy, and Contextual Recall
 
-## Question count and sharding
+## Workflow
 
-The default question count and shard size are defined in
-`configs/evaluation.json`. Pull request runs use that default unless the
-repository variable `EVAL_QUESTION_COUNT` is set. A manual workflow run can
-override it with the optional `question_count` input.
+The expensive workflow runs on a pull request only while it has the `eval`
+label. Every run processes all 50 questions as five parallel shards of 10.
+Each shard generates fresh responses and then starts DeepEval immediately.
 
-Questions are divided into shards of 10. Each matrix job generates its shard
-with Qwen and immediately starts DeepEval with Gemma. Other shards continue in
-parallel. After every shard finishes, the aggregate job combines responses,
-per-question scores, weighted metric averages, timings, and errors into one
-report.
+Successful scores are retained. If a judge call returns malformed JSON or
+times out, the shard retries only the missing `(question, metric)` pairs. It
+does not regenerate responses or rerun metrics that already returned scores.
 
-Examples:
+A prerequisite job restores the quantized Ollama model cache. On the first
+run, it pulls Qwen and Gemma once and saves the populated cache before the
+matrix starts. Every shard then restores the completed cache and only verifies
+the model manifests. Python dependencies use the `setup-python` pip cache.
 
-- `10` questions creates one shard.
-- `25` questions creates shards of 10, 10, and 5.
-- `50` questions creates five parallel shards of 10.
+## Quality gate
+
+All 50 responses must be present. Each metric must independently satisfy:
+
+- At least 90% score coverage
+- Average score of at least 0.5
+- At least 90% of evaluated scores at or above 0.5
+
+Missing judge scores remain visible in the report as warnings. They fail CI
+only when one of the coverage or quality conditions is not met.
+
+## Reason trials
+
+`configs/evaluation.json` controls `include_reason` and the judge output limit.
+The controlled comparison uses:
+
+| Trial | Reasons | Judge output tokens |
+| --- | ---: | ---: |
+| No reasons | false | 1024 |
+| Reasons | true | 2048 |
+
+Both trials keep the dataset, response prompt, model tags, temperatures,
+context windows, metrics, thresholds, and sharding identical.
 
 ## Sampling parameters
 
-| Setting | Response model | Judge model |
+| Setting | Response | Judge |
 | --- | ---: | ---: |
 | Temperature | 0.1 | 0.0 |
-| Maximum output tokens | 256 | 1024 |
+| Output tokens | 256 | trial-dependent |
 | Context window | 16384 | 16384 |
 | Seed | 42 | 42 |
 
-The larger judge output limit prevents DeepEval JSON and metric reasons from
-being cut off. Metric threshold is `0.5`; a low score is reported, while a
-missing or invalid score fails the shard and final aggregation.
-
 ## Artifacts
 
-Every shard uploads generated responses, generation timing, raw DeepEval
-results, metric summaries, model logs, and console logs. The final artifact
-contains:
-
-- `responses.json`: all generated responses in dataset order
-- `evaluation-summary.json`: aggregate and per-question scores
-- `evaluation-report.md`: the readable final report
+Every shard uploads generated responses, generation timings, raw DeepEval
+results, retry results, metric summaries, and model logs. The final artifact
+contains the combined `responses.json`, `evaluation-summary.json`, and
+`evaluation-report.md`.
 
 ## Local validation
 
