@@ -123,6 +123,7 @@ class DeepEvalPipelineTests(unittest.TestCase):
             started_at="2026-01-01T00:00:00+00:00",
             duration_seconds=12.5,
             confident_enabled=True,
+            include_reason=True,
         )
 
         self.assertEqual(errors, [])
@@ -163,6 +164,7 @@ class DeepEvalPipelineTests(unittest.TestCase):
             started_at="2026-01-01T00:00:00+00:00",
             duration_seconds=1,
             confident_enabled=False,
+            include_reason=True,
         )
 
         self.assertEqual(len(errors), 3)
