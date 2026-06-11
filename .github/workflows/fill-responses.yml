@@ -74,14 +74,13 @@ jobs:
     env:
       RESPONSE_MODEL: qwen3:4b-instruct
       JUDGE_MODEL: gemma3:4b-it-qat
-      CACHE_KEY: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-v2
     steps:
       - name: Restore prepared Ollama model cache
         id: restore-models
         uses: actions/cache/restore@v4
         with:
           path: ~/.ollama/models
-          key: ${{ env.CACHE_KEY }}
+          key: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-v2
 
       - name: Install Ollama on cache miss
         if: steps.restore-models.outputs.cache-hit != 'true'
@@ -116,7 +115,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
-          key: ${{ env.CACHE_KEY }}
+          key: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-v2
 
   generate-and-evaluate:
     needs: [prepare, tests, prepare-model-cache]
