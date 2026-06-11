@@ -76,7 +76,7 @@ jobs:
       DEEPEVAL_TELEMETRY_OPT_OUT: "1"
       DEEPEVAL_PER_TASK_TIMEOUT_SECONDS_OVERRIDE: "900"
       DEEPEVAL_JUDGE_NUM_CTX: "16384"
-      DEEPEVAL_JUDGE_NUM_PREDICT: "1024"
+      DEEPEVAL_JUDGE_NUM_PREDICT: "2048"
 
     steps:
       - uses: actions/checkout@v4
@@ -256,3 +256,4 @@ jobs:
           if [[ "$AGGREGATE_OUTCOME" != "success" ]]; then
             echo "The final aggregate report is incomplete." >&2
             exit 1
+          fi

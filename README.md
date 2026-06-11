@@ -30,7 +30,7 @@ Examples:
 | Setting | Response model | Judge model |
 | --- | ---: | ---: |
 | Temperature | 0.1 | 0.0 |
-| Maximum output tokens | 256 | 1024 |
+| Maximum output tokens | 256 | 2048 |
 | Context window | 16384 | 16384 |
 | Seed | 42 | 42 |
 
