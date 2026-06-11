@@ -4,12 +4,13 @@ name: Qwen responses with Gemma DeepEval judge
   pull_request:
     branches:
       - qwen-gemma-tr1
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       question_count:
         description: Number of questions to generate and evaluate
         required: false
-        default: "10"
+        default: "50"
 
 permissions:
   contents: read
@@ -20,11 +21,17 @@ concurrency:
 
 jobs:
   prepare:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'eval')
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       question_count: ${{ steps.plan.outputs.question_count }}
       shard_count: ${{ steps.plan.outputs.shard_count }}
+      include_reason: ${{ steps.plan.outputs.include_reason }}
+      judge_max_tokens: ${{ steps.plan.outputs.judge_max_tokens }}
+      metric_threshold: ${{ steps.plan.outputs.metric_threshold }}
+      minimum_coverage: ${{ steps.plan.outputs.minimum_coverage }}
+      minimum_pass_rate: ${{ steps.plan.outputs.minimum_pass_rate }}
     steps:
       - uses: actions/checkout@v4
 
@@ -34,9 +41,6 @@ jobs:
         run: |
           requested='${{ inputs.question_count }}'
           if [[ -z "$requested" ]]; then
-            requested='${{ vars.EVAL_QUESTION_COUNT }}'
-          fi
-          if [[ -z "$requested" ]]; then
             requested=$(jq -r '.question_count' configs/evaluation.json)
           fi
           shard_size=$(jq -r '.shard_size' configs/evaluation.json)
@@ -45,8 +49,14 @@ jobs:
             --question-count "$requested" \
             --shard-size "$shard_size" \
             --github-output "$GITHUB_OUTPUT"
+          echo "include_reason=$(jq -r '.include_reason' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "judge_max_tokens=$(jq -r '.judge_max_tokens' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "metric_threshold=$(jq -r '.metric_threshold' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "minimum_coverage=$(jq -r '.minimum_metric_coverage' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "minimum_pass_rate=$(jq -r '.minimum_metric_pass_rate' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
 
   tests:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'eval')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -76,7 +86,9 @@ jobs:
       DEEPEVAL_TELEMETRY_OPT_OUT: "1"
       DEEPEVAL_PER_TASK_TIMEOUT_SECONDS_OVERRIDE: "900"
       DEEPEVAL_JUDGE_NUM_CTX: "16384"
-      DEEPEVAL_JUDGE_NUM_PREDICT: "1024"
+      DEEPEVAL_JUDGE_NUM_PREDICT: ${{ needs.prepare.outputs.judge_max_tokens }}
+      INCLUDE_REASON: ${{ needs.prepare.outputs.include_reason }}
+      METRIC_THRESHOLD: ${{ needs.prepare.outputs.metric_threshold }}
 
     steps:
       - uses: actions/checkout@v4
@@ -111,6 +123,14 @@ jobs:
           curl -fsSL https://ollama.com/install.sh -o /tmp/install-ollama.sh
           sh /tmp/install-ollama.sh \
             2>&1 | tee "$RESULTS_DIR/ollama-install.log"
+
+      - name: Restore quantized Ollama models
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-v1
+          restore-keys: |
+            ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-
 
       - name: Start Ollama
         shell: bash
@@ -176,6 +196,10 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          reason_flag="--no-include-reason"
+          if [[ "$INCLUDE_REASON" == "true" ]]; then
+            reason_flag="--include-reason"
+          fi
           python -m evals.run_evaluation \
             --responses "$RESULTS_DIR/responses.json" \
             --goldens dataset/golden_dataset.json \
@@ -183,9 +207,31 @@ jobs:
             --response-model "$RESPONSE_MODEL" \
             --judge-model "$JUDGE_MODEL" \
             --expected-count '${{ matrix.limit }}' \
-            --threshold 0.5 \
+            --threshold "$METRIC_THRESHOLD" \
+            "$reason_flag" \
             --identifier "qwen-gemma-tr1-${{ github.run_id }}-shard-${{ matrix.shard }}" \
             2>&1 | tee "$RESULTS_DIR/deepeval-console.log"
+
+      - name: Retry only missing metric scores
+        id: retry
+        if: always() && steps.validation.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          reason_flag="--no-include-reason"
+          if [[ "$INCLUDE_REASON" == "true" ]]; then
+            reason_flag="--include-reason"
+          fi
+          python -m evals.retry_missing \
+            --summary "$RESULTS_DIR/evaluation-summary.json" \
+            --responses "$RESULTS_DIR/responses.json" \
+            --goldens dataset/golden_dataset.json \
+            --output "$RESULTS_DIR/retry-summary.json" \
+            --response-model "$RESPONSE_MODEL" \
+            --judge-model "$JUDGE_MODEL" \
+            --threshold "$METRIC_THRESHOLD" \
+            "$reason_flag" \
+            2>&1 | tee "$RESULTS_DIR/retry-console.log"
 
       - name: Upload shard responses, metrics, and logs
         if: always()
@@ -201,15 +247,19 @@ jobs:
         env:
           GENERATION_OUTCOME: ${{ steps.generation.outcome }}
           VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
-          EVALUATION_OUTCOME: ${{ steps.evaluation.outcome }}
+          RETRY_OUTCOME: ${{ steps.retry.outcome }}
         run: |
-          if [[ "$GENERATION_OUTCOME" != "success" || "$VALIDATION_OUTCOME" != "success" || "$EVALUATION_OUTCOME" != "success" ]]; then
-            echo "Shard generation, validation, or evaluation failed." >&2
+          if [[ "$GENERATION_OUTCOME" != "success" || "$VALIDATION_OUTCOME" != "success" || "$RETRY_OUTCOME" != "success" ]]; then
+            echo "Shard generation, validation, or targeted retry failed." >&2
+            exit 1
+          fi
+          if [[ ! -f "$RESULTS_DIR/evaluation-summary.json" ]]; then
+            echo "The shard did not produce an evaluation summary." >&2
             exit 1
           fi
 
   aggregate:
-    if: always()
+    if: always() && (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'eval'))
     needs: [prepare, generate-and-evaluate]
     runs-on: ubuntu-24.04
     steps:
@@ -230,6 +280,9 @@ jobs:
             --dataset dataset/responses.json \
             --question-count '${{ needs.prepare.outputs.question_count }}' \
             --expected-shards '${{ needs.prepare.outputs.shard_count }}' \
+            --metric-threshold '${{ needs.prepare.outputs.metric_threshold }}' \
+            --minimum-coverage '${{ needs.prepare.outputs.minimum_coverage }}' \
+            --minimum-pass-rate '${{ needs.prepare.outputs.minimum_pass_rate }}' \
             --output-dir aggregate
 
       - name: Publish aggregate report
@@ -256,3 +309,4 @@ jobs:
           if [[ "$AGGREGATE_OUTCOME" != "success" ]]; then
             echo "The final aggregate report is incomplete." >&2
             exit 1
+          fi

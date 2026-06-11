@@ -1,5 +1,5 @@
 {
-  "question_count": 10,
+  "question_count": 50,
   "shard_size": 10,
   "max_parallel": 5,
   "response_model": "qwen3:4b-instruct",
@@ -7,9 +7,12 @@
   "response_max_tokens": 256,
   "response_temperature": 0.1,
   "response_num_ctx": 16384,
-  "judge_max_tokens": 1024,
+  "judge_max_tokens": 2048,
   "judge_temperature": 0.0,
   "judge_num_ctx": 16384,
+  "include_reason": true,
   "seed": 42,
-  "metric_threshold": 0.5
+  "metric_threshold": 0.5,
+  "minimum_metric_coverage": 0.9,
+  "minimum_metric_pass_rate": 0.9
 }
