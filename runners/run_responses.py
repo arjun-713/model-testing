@@ -22,9 +22,7 @@ except ModuleNotFoundError:
     from validate_responses import validate_entries
 
 
-SYSTEM_PROMPT_VERSION = "jenkins-concise-v1"
-
-SYSTEM_PROMPT = """
+CONCISE_SYSTEM_PROMPT = """
 You are JenkinsBot, an expert AI assistant specialized in Jenkins and its ecosystem.
 
 Answer the user's Jenkins question using only facts supported by the supplied retrieval context.
@@ -43,6 +41,36 @@ If the answer is not found in the provided context or prior conversation, respon
 
 Return only the final answer.
 """.strip()
+
+ORIGINAL_SYSTEM_PROMPT = """
+You are JenkinsBot, an expert AI assistant specialized in Jenkins and its ecosystem.
+
+You help users with Jenkins-related topics such as CI/CD pipelines, plugin usage, configuration, administration, and troubleshooting.
+
+You are provided with:
+- Relevant retrieved context from Jenkins documentation, plugin metadata, or community sources.
+- The prior conversation history, which may contain useful clarification or follow-up details.
+
+Your job is to generate a clear, accurate, and helpful answer to the user's current query by:
+- Carefully reading the retrieved context and identifying the parts that directly address the question.
+- Synthesizing and rephrasing the relevant information in your own words.
+- Providing a concise explanation that is easy to understand, rather than copy-pasting large sections of context verbatim.
+
+You should not:
+- Invent or assume facts that are not supported by the retrieved context or conversation history.
+- Quote large blocks of text directly from the context unless absolutely necessary.
+- Answer questions when no relevant information is available.
+
+If the answer is not found in the provided context or prior conversation, respond with:
+"I'm not able to answer based on the available information."
+
+Be accurate, helpful, and concise.
+""".strip()
+
+PROMPT_PROFILES = {
+    "concise": ("jenkins-concise-v1", CONCISE_SYSTEM_PROMPT),
+    "original": ("jenkins-original-v1", ORIGINAL_SYSTEM_PROMPT),
+}
 
 
 def utc_now() -> str:
@@ -96,13 +124,14 @@ def post_chat(
     num_ctx: int,
     temperature: float,
     timeout: float,
+    system_prompt: str,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
         "stream": False,
         "keep_alive": "30m",
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         "options": {
@@ -144,6 +173,8 @@ def run(args: argparse.Namespace) -> int:
     jsonl_file = args.output_dir / f"{args.model_name}.jsonl"
     jsonl_file.unlink(missing_ok=True)
     logger = configure_logging(log_file)
+    prompt_profile = getattr(args, "prompt_profile", "concise")
+    prompt_version, system_prompt = PROMPT_PROFILES[prompt_profile]
 
     try:
         source_entries = json.loads(args.input.read_text(encoding="utf-8"))
@@ -180,7 +211,8 @@ def run(args: argparse.Namespace) -> int:
             "timestamp": run_started_at,
             "model_name": args.model_name,
             "model": args.model,
-            "prompt_version": SYSTEM_PROMPT_VERSION,
+            "prompt_version": prompt_version,
+            "prompt_profile": prompt_profile,
             "input_file": str(args.input),
             "output_file": str(output_file),
             "question_count": len(entries),
@@ -238,6 +270,7 @@ def run(args: argparse.Namespace) -> int:
                     num_ctx=args.num_ctx,
                     temperature=args.temperature,
                     timeout=args.request_timeout,
+                    system_prompt=system_prompt,
                 )
                 error = None
                 break
@@ -324,7 +357,8 @@ def run(args: argparse.Namespace) -> int:
     summary = {
         "model_name": args.model_name,
         "model": args.model,
-        "prompt_version": SYSTEM_PROMPT_VERSION,
+        "prompt_version": prompt_version,
+        "prompt_profile": prompt_profile,
         "started_at": run_started_at,
         "completed_at": utc_now(),
         "question_count": len(entries),
@@ -379,6 +413,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--num-ctx", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--prompt-profile",
+        choices=sorted(PROMPT_PROFILES),
+        default="concise",
+        help="System prompt profile used for response generation.",
+    )
     parser.add_argument(
         "--base-url",
         default=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
