@@ -11,6 +11,8 @@ The evaluation workflow uses one fixed model combination:
 The expensive workflow runs on a pull request only while it has the `eval`
 label. Every run processes all 50 questions as five parallel shards of 10.
 Each shard generates fresh responses and then starts DeepEval immediately.
+Within each shard, DeepEval evaluates up to four test cases concurrently and
+Ollama exposes four parallel inference slots to use the runner's CPU cores.
 
 Successful scores are retained. If a judge call returns malformed JSON or
 times out, the shard retries only the missing `(question, metric)` pairs. It
@@ -53,6 +55,7 @@ context windows, metrics, thresholds, and sharding identical.
 | Output tokens | 256 | trial-dependent |
 | Context window | 16384 | 16384 |
 | Seed | 42 | 42 |
+| DeepEval workers | - | 4 |
 
 ## Artifacts
 

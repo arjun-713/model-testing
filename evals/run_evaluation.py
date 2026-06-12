@@ -121,6 +121,7 @@ def summarize_result(
     duration_seconds: float,
     confident_enabled: bool,
     include_reason: bool,
+    max_concurrent: int = 1,
     metric_names: tuple[str, ...] = METRIC_NAMES,
 ) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
@@ -217,6 +218,7 @@ def summarize_result(
         "duration_seconds": round(duration_seconds, 3),
         "confident_ai_enabled": confident_enabled,
         "include_reason": include_reason,
+        "max_concurrent": max_concurrent,
         "confident_link": raw_result.get("confident_link"),
         "test_run_id": raw_result.get("test_run_id"),
         "generator_average_score": round(statistics.fmean(generator_scores), 4)
@@ -237,6 +239,7 @@ def write_report(summary: dict[str, Any], output_file: Path) -> None:
         f"- Judge model: `{summary['judge_model']}`",
         f"- Questions: {summary['question_count']}",
         f"- Evaluation time: {summary['duration_seconds']} seconds",
+        f"- Concurrent workers: {summary['max_concurrent']}",
         f"- Generator average: {summary['generator_average_score']}",
         f"- Confident AI report: {summary.get('confident_link') or 'not uploaded'}",
         "",
@@ -294,12 +297,14 @@ def run(args: argparse.Namespace) -> int:
         args.base_url,
         args.threshold,
         include_reason=args.include_reason,
+        async_mode=args.max_concurrent > 1,
     )
     started_at = utc_now()
     started = time.perf_counter()
     print(
         f"Evaluating {len(test_cases)} responses from {args.response_model} "
-        f"with judge {args.judge_model}"
+        f"with judge {args.judge_model} using "
+        f"{args.max_concurrent} concurrent workers"
     )
     try:
         result = evaluate(
@@ -312,8 +317,12 @@ def run(args: argparse.Namespace) -> int:
                 "question_count": args.expected_count,
                 "threshold": args.threshold,
                 "include_reason": args.include_reason,
+                "max_concurrent": args.max_concurrent,
             },
-            async_config=AsyncConfig(run_async=False, max_concurrent=1),
+            async_config=AsyncConfig(
+                run_async=args.max_concurrent > 1,
+                max_concurrent=args.max_concurrent,
+            ),
             display_config=DisplayConfig(
                 show_indicator=True,
                 print_results=True,
@@ -356,6 +365,7 @@ def run(args: argparse.Namespace) -> int:
         duration_seconds=duration,
         confident_enabled=bool(os.environ.get("CONFIDENT_API_KEY")),
         include_reason=args.include_reason,
+        max_concurrent=args.max_concurrent,
     )
     save_json(args.output_dir / "evaluation-summary.json", summary)
     write_report(summary, args.output_dir / "evaluation-report.md")
@@ -394,7 +404,16 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
     )
     parser.add_argument("--identifier", required=True)
-    return parser.parse_args()
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=int(os.environ.get("DEEPEVAL_MAX_CONCURRENT", "4")),
+        help="Maximum DeepEval test cases evaluated concurrently.",
+    )
+    args = parser.parse_args()
+    if args.max_concurrent < 1:
+        parser.error("--max-concurrent must be at least 1")
+    return args
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
   "question_count": 50,
   "shard_size": 10,
   "max_parallel": 5,
+  "deepeval_max_concurrent": 4,
   "response_model": "qwen3:4b-instruct",
   "judge_model": "gemma3:4b-it-qat",
   "response_max_tokens": 256,

@@ -18,6 +18,7 @@ def build_metrics(
     base_url: str,
     threshold: float,
     include_reason: bool = True,
+    async_mode: bool = False,
     metric_names: tuple[str, ...] = METRIC_NAMES,
 ):
     judge_num_ctx = int(os.environ.get("DEEPEVAL_JUDGE_NUM_CTX", "16384"))
@@ -36,7 +37,7 @@ def build_metrics(
         "model": judge_model,
         "threshold": threshold,
         "include_reason": include_reason,
-        "async_mode": False,
+        "async_mode": async_mode,
         "verbose_mode": include_reason,
     }
     metric_types = {
