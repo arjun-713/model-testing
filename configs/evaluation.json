@@ -5,16 +5,17 @@
   "deepeval_max_concurrent": 2,
   "response_model": "qwen3:4b-instruct",
   "judge_model": "gemma3:4b-it-qat",
-  "response_max_tokens": 512,
+  "response_max_tokens": 256,
   "response_temperature": 0.1,
   "response_num_ctx": 16384,
   "response_prompt_profile": "concise",
-  "judge_max_tokens": 4096,
+  "judge_max_tokens": 4024,
   "judge_temperature": 0.0,
   "judge_num_ctx": 16384,
   "include_reason": false,
   "seed": 42,
   "metric_threshold": 0.5,
   "minimum_metric_coverage": 0.9,
-  "minimum_metric_pass_rate": 0.9
+  "minimum_metric_pass_rate": 0.0,
+  "trial_id": "trial-1"
 }

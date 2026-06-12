@@ -204,6 +204,7 @@ def run(args: argparse.Namespace) -> int:
     run_start = time.perf_counter()
     failures: list[str] = []
     durations: list[float] = []
+    prompt_eval_durations: list[int] = []
     append_jsonl(
         jsonl_file,
         {
@@ -232,6 +233,45 @@ def run(args: argparse.Namespace) -> int:
         args.max_tokens,
         args.temperature,
     )
+
+    warmup_metrics: dict[str, Any] = {}
+    warm_prompt_cache = getattr(args, "warm_prompt_cache", False)
+    if warm_prompt_cache:
+        warmup_started = time.perf_counter()
+        try:
+            warmup = post_chat(
+                base_url=args.base_url,
+                model=args.model,
+                prompt="Question:\n\nRetrieval context:\n",
+                max_tokens=1,
+                num_ctx=args.num_ctx,
+                temperature=0.0,
+                timeout=args.request_timeout,
+                system_prompt=system_prompt,
+            )
+            warmup_metrics = {
+                key: warmup.get(key)
+                for key in (
+                    "load_duration",
+                    "prompt_eval_count",
+                    "prompt_eval_duration",
+                    "eval_count",
+                    "eval_duration",
+                )
+            }
+            append_jsonl(
+                jsonl_file,
+                {
+                    "event": "prompt_cache_warmed",
+                    "timestamp": utc_now(),
+                    "duration_seconds": round(
+                        time.perf_counter() - warmup_started, 3
+                    ),
+                    "ollama_metrics": warmup_metrics,
+                },
+            )
+        except (RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+            logger.warning("Prompt cache warmup failed; continuing: %s", exc)
 
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict) or not isinstance(entry.get("input"), str):
@@ -313,6 +353,9 @@ def run(args: argparse.Namespace) -> int:
         entry["actual_output"] = output
         if not output:
             failures.append(entry_id)
+        prompt_eval_duration = response.get("prompt_eval_duration")
+        if isinstance(prompt_eval_duration, int):
+            prompt_eval_durations.append(prompt_eval_duration)
 
         append_jsonl(
             jsonl_file,
@@ -377,6 +420,18 @@ def run(args: argparse.Namespace) -> int:
         if durations
         else None,
         "validation_errors": validation_errors,
+        "prompt_cache": {
+            "enabled": warm_prompt_cache,
+            "warmup_metrics": warmup_metrics,
+            "first_prompt_eval_duration_ns": prompt_eval_durations[0]
+            if prompt_eval_durations
+            else None,
+            "average_later_prompt_eval_duration_ns": round(
+                sum(prompt_eval_durations[1:]) / len(prompt_eval_durations[1:])
+            )
+            if len(prompt_eval_durations) > 1
+            else None,
+        },
     }
     save_json(output_file, entries)
     save_json(summary_file, summary)
@@ -418,6 +473,12 @@ def parse_args() -> argparse.Namespace:
         choices=sorted(PROMPT_PROFILES),
         default="concise",
         help="System prompt profile used for response generation.",
+    )
+    parser.add_argument(
+        "--warm-prompt-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Warm Ollama's reusable system-prompt prefix before generation.",
     )
     parser.add_argument(
         "--base-url",

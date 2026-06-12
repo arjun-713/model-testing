@@ -149,6 +149,62 @@ class ResponsePipelineTests(unittest.TestCase):
             self.assertEqual(summary["filled_count"], 0)
             self.assertEqual(summary["failed_ids"], ["q-001"])
 
+    def test_runner_warms_and_reports_prompt_cache(self) -> None:
+        source = [
+            {
+                "id": "q-001",
+                "input": "Question?",
+                "actual_output": "",
+                "retrieval_context": ["Context."],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            input_file = root / "responses.json"
+            output_dir = root / "results"
+            input_file.write_text(json.dumps(source), encoding="utf-8")
+            args = argparse.Namespace(
+                model="test-model:latest",
+                model_name="test-model",
+                input=input_file,
+                output_dir=output_dir,
+                offset=0,
+                limit=1,
+                max_tokens=256,
+                num_ctx=4096,
+                temperature=0.1,
+                base_url="http://127.0.0.1:11434",
+                request_timeout=5.0,
+                retries=0,
+                prompt_profile="concise",
+                warm_prompt_cache=True,
+            )
+            warmup = {
+                "message": {"content": ""},
+                "prompt_eval_duration": 20,
+            }
+            response = {
+                "message": {"content": "Answer."},
+                "prompt_eval_duration": 10,
+            }
+
+            with patch(
+                "runners.run_responses.post_chat",
+                side_effect=[warmup, response],
+            ):
+                self.assertEqual(run(args), 0)
+
+            summary = json.loads(
+                (output_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(summary["prompt_cache"]["enabled"])
+            self.assertEqual(
+                summary["prompt_cache"]["warmup_metrics"][
+                    "prompt_eval_duration"
+                ],
+                20,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -85,11 +86,25 @@ def retry(args: argparse.Namespace) -> int:
     summary_cases = {
         str(case.get("id")): case for case in summary.get("cases", [])
     }
+    for test_case in test_cases:
+        case_id = str(test_case.name)
+        if case_id in summary_cases:
+            continue
+        case = {
+            "id": case_id,
+            "input": test_case.input,
+            "actual_output": test_case.actual_output,
+            "expected_output": test_case.expected_output,
+            "metrics": {},
+        }
+        summary.setdefault("cases", []).append(case)
+        summary_cases[case_id] = case
     pairs = missing_pairs(summary)
     retry_log: list[dict[str, Any]] = []
     started = time.perf_counter()
 
-    for case_id, metric_name in pairs:
+    def measure_pair(pair: tuple[str, str]) -> tuple[str, str, dict[str, Any]]:
+        case_id, metric_name = pair
         metric = build_metrics(
             args.judge_model,
             args.base_url,
@@ -103,6 +118,12 @@ def retry(args: argparse.Namespace) -> int:
         except Exception as exc:  # DeepEval provider errors vary by metric.
             error = f"{type(exc).__name__}: {exc}"
         payload = metric_payload(metric, error)
+        return case_id, metric_name, payload
+
+    with ThreadPoolExecutor(max_workers=args.max_concurrent) as executor:
+        measured = list(executor.map(measure_pair, pairs))
+
+    for case_id, metric_name, payload in measured:
         summary_cases[case_id].setdefault("metrics", {})[metric_name] = payload
         retry_log.append(
             {
@@ -141,6 +162,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--response-model", required=True)
     parser.add_argument("--judge-model", required=True)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--max-concurrent", type=int, default=2)
     parser.add_argument(
         "--include-reason",
         action=argparse.BooleanOptionalAction,
@@ -150,7 +172,10 @@ def parse_args() -> argparse.Namespace:
         "--base-url",
         default="http://127.0.0.1:11434",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_concurrent < 1:
+        parser.error("--max-concurrent must be at least 1")
+    return args
 
 
 if __name__ == "__main__":

@@ -123,6 +123,7 @@ def summarize_result(
     include_reason: bool,
     max_concurrent: int = 1,
     metric_names: tuple[str, ...] = METRIC_NAMES,
+    expected_cases: list[LLMTestCase] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     test_results = raw_result.get("test_results")
@@ -137,10 +138,32 @@ def summarize_result(
     metric_passes: dict[str, int] = {name: 0 for name in metric_names}
     cases: list[dict[str, Any]] = []
 
+    results_by_id: dict[str, dict[str, Any]] = {}
     for index, result in enumerate(test_results):
         metadata = result.get("metadata")
         case_id = metadata.get("id") if isinstance(metadata, dict) else None
         case_id = str(case_id or result.get("name") or f"index-{index}")
+        results_by_id[case_id] = result
+
+    ordered_results: list[tuple[str, dict[str, Any]]] = []
+    if expected_cases is None:
+        ordered_results = list(results_by_id.items())
+    else:
+        for case in expected_cases:
+            case_id = str(case.name)
+            result = results_by_id.get(case_id)
+            if result is None:
+                errors.append(f"{case_id}: DeepEval test result is missing.")
+                result = {
+                    "name": case_id,
+                    "input": case.input,
+                    "actual_output": case.actual_output,
+                    "expected_output": case.expected_output,
+                    "metrics_data": [],
+                }
+            ordered_results.append((case_id, result))
+
+    for case_id, result in ordered_results:
         metric_data = result.get("metrics_data")
         if not isinstance(metric_data, list):
             errors.append(f"{case_id}: metrics_data is missing.")
@@ -297,7 +320,9 @@ def run(args: argparse.Namespace) -> int:
         args.base_url,
         args.threshold,
         include_reason=args.include_reason,
-        async_mode=args.max_concurrent > 1,
+        # Two test cases run concurrently. Metrics inside each case stay
+        # sequential so Ollama never receives six judge requests at once.
+        async_mode=False,
     )
     started_at = utc_now()
     started = time.perf_counter()
@@ -366,6 +391,7 @@ def run(args: argparse.Namespace) -> int:
         confident_enabled=bool(os.environ.get("CONFIDENT_API_KEY")),
         include_reason=args.include_reason,
         max_concurrent=args.max_concurrent,
+        expected_cases=test_cases,
     )
     save_json(args.output_dir / "evaluation-summary.json", summary)
     write_report(summary, args.output_dir / "evaluation-report.md")
