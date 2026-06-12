@@ -18,10 +18,9 @@ Successful scores are retained. If a judge call returns malformed JSON or
 times out, the shard retries only the missing `(question, metric)` pairs. It
 does not regenerate responses or rerun metrics that already returned scores.
 
-A prerequisite job restores the quantized Ollama model cache. On the first
-run, it pulls Qwen and Gemma once and saves the populated cache before the
-matrix starts. Every shard then restores the completed cache and only verifies
-the model manifests. Python dependencies use the `setup-python` pip cache.
+This cache-off trial deliberately pulls Qwen and Gemma independently in every
+matrix shard. Python dependencies still use the `setup-python` pip cache so the
+comparison isolates Ollama model caching rather than dependency installation.
 
 ## Quality gate
 

@@ -70,69 +70,8 @@ jobs:
       - run: python -m pip install -r requirements-eval.txt
       - run: python -m unittest discover -s tests -v
 
-  prepare-model-cache:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'eval')
-    runs-on: ubuntu-24.04
-    env:
-      RESPONSE_MODEL: qwen3:4b-instruct
-      JUDGE_MODEL: gemma3:4b-it-qat
-      OLLAMA_MODELS: /home/runner/.ollama/models
-    steps:
-      - name: Restore prepared Ollama model cache
-        id: restore-models
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.OLLAMA_MODELS }}
-          key: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-v3
-
-      - name: Install Ollama on cache miss
-        if: steps.restore-models.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          curl -fsSL https://ollama.com/install.sh -o /tmp/install-ollama.sh
-          sh /tmp/install-ollama.sh
-
-      - name: Start Ollama on cache miss
-        if: steps.restore-models.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          sudo systemctl stop ollama 2>/dev/null || true
-          sudo pkill -x ollama 2>/dev/null || true
-          mkdir -p "$OLLAMA_MODELS"
-          nohup ollama serve > /tmp/ollama-cache-builder.log 2>&1 &
-          for attempt in {1..30}; do
-            if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
-              exit 0
-            fi
-            sleep 2
-          done
-          cat /tmp/ollama-cache-builder.log
-          exit 1
-
-      - name: Pull quantized models once
-        if: steps.restore-models.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          ollama pull "$RESPONSE_MODEL"
-          ollama pull "$JUDGE_MODEL"
-
-      - name: Verify models are in the cache directory
-        if: steps.restore-models.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          test -d "$OLLAMA_MODELS/manifests"
-          test -d "$OLLAMA_MODELS/blobs"
-          du -sh "$OLLAMA_MODELS"
-
-      - name: Save prepared Ollama model cache
-        if: steps.restore-models.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.OLLAMA_MODELS }}
-          key: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-v3
-
   generate-and-evaluate:
-    needs: [prepare, tests, prepare-model-cache]
+    needs: [prepare, tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     strategy:
@@ -190,14 +129,6 @@ jobs:
           sh /tmp/install-ollama.sh \
             2>&1 | tee "$RESULTS_DIR/ollama-install.log"
 
-      - name: Restore prepared quantized Ollama models
-        id: restore-models
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.OLLAMA_MODELS }}
-          key: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-v3
-          fail-on-cache-miss: true
-
       - name: Start Ollama
         shell: bash
         run: |
@@ -213,7 +144,7 @@ jobs:
           echo "Ollama did not become ready within 60 seconds." >&2
           exit 1
 
-      - name: Verify cached response and judge models
+      - name: Pull quantized response and judge models
         shell: bash
         run: |
           started=$(date +%s)
