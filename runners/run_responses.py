@@ -22,7 +22,27 @@ except ModuleNotFoundError:
     from validate_responses import validate_entries
 
 
-SYSTEM_PROMPT = """
+CONCISE_SYSTEM_PROMPT = """
+You are JenkinsBot, an expert AI assistant specialized in Jenkins and its ecosystem.
+
+Answer the user's Jenkins question using only facts supported by the supplied retrieval context.
+
+Response requirements:
+- Give the direct answer or likely cause in the first sentence.
+- Normally use 2 to 4 complete sentences and no more than 120 words.
+- Include only the most relevant fix, configuration, or troubleshooting step.
+- Use a short code or command snippet only when it is necessary to make the answer actionable.
+- Paraphrase the evidence. Do not copy long passages, repeat the question, mention the retrieval context, add an introduction, or restate the same point.
+- Prioritize a complete core answer over extra detail. Do not begin optional detail that may be cut off.
+- Do not invent facts, assumptions, commands, or configuration values that are not supported by the context.
+
+If the answer is not found in the provided context or prior conversation, respond with:
+"I'm not able to answer based on the available information."
+
+Return only the final answer.
+""".strip()
+
+ORIGINAL_SYSTEM_PROMPT = """
 You are JenkinsBot, an expert AI assistant specialized in Jenkins and its ecosystem.
 
 You help users with Jenkins-related topics such as CI/CD pipelines, plugin usage, configuration, administration, and troubleshooting.
@@ -46,6 +66,11 @@ If the answer is not found in the provided context or prior conversation, respon
 
 Be accurate, helpful, and concise.
 """.strip()
+
+PROMPT_PROFILES = {
+    "concise": ("jenkins-concise-v1", CONCISE_SYSTEM_PROMPT),
+    "original": ("jenkins-original-v1", ORIGINAL_SYSTEM_PROMPT),
+}
 
 
 def utc_now() -> str:
@@ -99,13 +124,14 @@ def post_chat(
     num_ctx: int,
     temperature: float,
     timeout: float,
+    system_prompt: str,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
         "stream": False,
         "keep_alive": "30m",
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         "options": {
@@ -147,6 +173,8 @@ def run(args: argparse.Namespace) -> int:
     jsonl_file = args.output_dir / f"{args.model_name}.jsonl"
     jsonl_file.unlink(missing_ok=True)
     logger = configure_logging(log_file)
+    prompt_profile = getattr(args, "prompt_profile", "concise")
+    prompt_version, system_prompt = PROMPT_PROFILES[prompt_profile]
 
     try:
         source_entries = json.loads(args.input.read_text(encoding="utf-8"))
@@ -176,6 +204,7 @@ def run(args: argparse.Namespace) -> int:
     run_start = time.perf_counter()
     failures: list[str] = []
     durations: list[float] = []
+    prompt_eval_durations: list[int] = []
     append_jsonl(
         jsonl_file,
         {
@@ -183,6 +212,8 @@ def run(args: argparse.Namespace) -> int:
             "timestamp": run_started_at,
             "model_name": args.model_name,
             "model": args.model,
+            "prompt_version": prompt_version,
+            "prompt_profile": prompt_profile,
             "input_file": str(args.input),
             "output_file": str(output_file),
             "question_count": len(entries),
@@ -202,6 +233,45 @@ def run(args: argparse.Namespace) -> int:
         args.max_tokens,
         args.temperature,
     )
+
+    warmup_metrics: dict[str, Any] = {}
+    warm_prompt_cache = getattr(args, "warm_prompt_cache", False)
+    if warm_prompt_cache:
+        warmup_started = time.perf_counter()
+        try:
+            warmup = post_chat(
+                base_url=args.base_url,
+                model=args.model,
+                prompt="Question:\n\nRetrieval context:\n",
+                max_tokens=1,
+                num_ctx=args.num_ctx,
+                temperature=0.0,
+                timeout=args.request_timeout,
+                system_prompt=system_prompt,
+            )
+            warmup_metrics = {
+                key: warmup.get(key)
+                for key in (
+                    "load_duration",
+                    "prompt_eval_count",
+                    "prompt_eval_duration",
+                    "eval_count",
+                    "eval_duration",
+                )
+            }
+            append_jsonl(
+                jsonl_file,
+                {
+                    "event": "prompt_cache_warmed",
+                    "timestamp": utc_now(),
+                    "duration_seconds": round(
+                        time.perf_counter() - warmup_started, 3
+                    ),
+                    "ollama_metrics": warmup_metrics,
+                },
+            )
+        except (RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+            logger.warning("Prompt cache warmup failed; continuing: %s", exc)
 
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict) or not isinstance(entry.get("input"), str):
@@ -240,6 +310,7 @@ def run(args: argparse.Namespace) -> int:
                     num_ctx=args.num_ctx,
                     temperature=args.temperature,
                     timeout=args.request_timeout,
+                    system_prompt=system_prompt,
                 )
                 error = None
                 break
@@ -282,6 +353,9 @@ def run(args: argparse.Namespace) -> int:
         entry["actual_output"] = output
         if not output:
             failures.append(entry_id)
+        prompt_eval_duration = response.get("prompt_eval_duration")
+        if isinstance(prompt_eval_duration, int):
+            prompt_eval_durations.append(prompt_eval_duration)
 
         append_jsonl(
             jsonl_file,
@@ -326,6 +400,8 @@ def run(args: argparse.Namespace) -> int:
     summary = {
         "model_name": args.model_name,
         "model": args.model,
+        "prompt_version": prompt_version,
+        "prompt_profile": prompt_profile,
         "started_at": run_started_at,
         "completed_at": utc_now(),
         "question_count": len(entries),
@@ -344,6 +420,18 @@ def run(args: argparse.Namespace) -> int:
         if durations
         else None,
         "validation_errors": validation_errors,
+        "prompt_cache": {
+            "enabled": warm_prompt_cache,
+            "warmup_metrics": warmup_metrics,
+            "first_prompt_eval_duration_ns": prompt_eval_durations[0]
+            if prompt_eval_durations
+            else None,
+            "average_later_prompt_eval_duration_ns": round(
+                sum(prompt_eval_durations[1:]) / len(prompt_eval_durations[1:])
+            )
+            if len(prompt_eval_durations) > 1
+            else None,
+        },
     }
     save_json(output_file, entries)
     save_json(summary_file, summary)
@@ -380,6 +468,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--num-ctx", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--prompt-profile",
+        choices=sorted(PROMPT_PROFILES),
+        default="concise",
+        help="System prompt profile used for response generation.",
+    )
+    parser.add_argument(
+        "--warm-prompt-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Warm Ollama's reusable system-prompt prefix before generation.",
+    )
     parser.add_argument(
         "--base-url",
         default=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
