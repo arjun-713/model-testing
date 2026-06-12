@@ -7,11 +7,27 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from runners.run_responses import run
+from runners.run_responses import PROMPT_PROFILES, run
 from runners.validate_responses import validate_entries
 
 
 class ResponsePipelineTests(unittest.TestCase):
+    def test_prompt_enforces_short_grounded_answers(self) -> None:
+        version, prompt = PROMPT_PROFILES["concise"]
+        self.assertEqual(version, "jenkins-concise-v1")
+        self.assertIn("2 to 4 complete sentences", prompt)
+        self.assertIn("no more than 120 words", prompt)
+        self.assertIn("using only facts supported", prompt)
+        self.assertIn(
+            "I'm not able to answer based on the available information.",
+            prompt,
+        )
+
+    def test_original_prompt_profile_is_available(self) -> None:
+        version, prompt = PROMPT_PROFILES["original"]
+        self.assertEqual(version, "jenkins-original-v1")
+        self.assertIn("Carefully reading the retrieved context", prompt)
+
     def test_validator_rejects_blank_outputs(self) -> None:
         errors = validate_entries(
             [{"id": "q-001", "actual_output": ""}], expected_count=1
