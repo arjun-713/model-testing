@@ -7,11 +7,27 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from runners.run_responses import run
+from runners.run_responses import PROMPT_PROFILES, run
 from runners.validate_responses import validate_entries
 
 
 class ResponsePipelineTests(unittest.TestCase):
+    def test_prompt_enforces_short_grounded_answers(self) -> None:
+        version, prompt = PROMPT_PROFILES["concise"]
+        self.assertEqual(version, "jenkins-concise-v1")
+        self.assertIn("2 to 4 complete sentences", prompt)
+        self.assertIn("no more than 120 words", prompt)
+        self.assertIn("using only facts supported", prompt)
+        self.assertIn(
+            "I'm not able to answer based on the available information.",
+            prompt,
+        )
+
+    def test_original_prompt_profile_is_available(self) -> None:
+        version, prompt = PROMPT_PROFILES["original"]
+        self.assertEqual(version, "jenkins-original-v1")
+        self.assertIn("Carefully reading the retrieved context", prompt)
+
     def test_validator_rejects_blank_outputs(self) -> None:
         errors = validate_entries(
             [{"id": "q-001", "actual_output": ""}], expected_count=1
@@ -132,6 +148,62 @@ class ResponsePipelineTests(unittest.TestCase):
             )
             self.assertEqual(summary["filled_count"], 0)
             self.assertEqual(summary["failed_ids"], ["q-001"])
+
+    def test_runner_warms_and_reports_prompt_cache(self) -> None:
+        source = [
+            {
+                "id": "q-001",
+                "input": "Question?",
+                "actual_output": "",
+                "retrieval_context": ["Context."],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            input_file = root / "responses.json"
+            output_dir = root / "results"
+            input_file.write_text(json.dumps(source), encoding="utf-8")
+            args = argparse.Namespace(
+                model="test-model:latest",
+                model_name="test-model",
+                input=input_file,
+                output_dir=output_dir,
+                offset=0,
+                limit=1,
+                max_tokens=256,
+                num_ctx=4096,
+                temperature=0.1,
+                base_url="http://127.0.0.1:11434",
+                request_timeout=5.0,
+                retries=0,
+                prompt_profile="concise",
+                warm_prompt_cache=True,
+            )
+            warmup = {
+                "message": {"content": ""},
+                "prompt_eval_duration": 20,
+            }
+            response = {
+                "message": {"content": "Answer."},
+                "prompt_eval_duration": 10,
+            }
+
+            with patch(
+                "runners.run_responses.post_chat",
+                side_effect=[warmup, response],
+            ):
+                self.assertEqual(run(args), 0)
+
+            summary = json.loads(
+                (output_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(summary["prompt_cache"]["enabled"])
+            self.assertEqual(
+                summary["prompt_cache"]["warmup_metrics"][
+                    "prompt_eval_duration"
+                ],
+                20,
+            )
 
 
 if __name__ == "__main__":

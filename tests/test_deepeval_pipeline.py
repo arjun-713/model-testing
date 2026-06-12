@@ -24,6 +24,7 @@ class DeepEvalPipelineTests(unittest.TestCase):
             "gemma3:4b-it-qat",
             "http://127.0.0.1:11434",
             0.5,
+            async_mode=True,
         )
 
         self.assertEqual(
@@ -35,6 +36,7 @@ class DeepEvalPipelineTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(metric.threshold == 0.5 for metric in metrics))
+        self.assertTrue(all(metric.async_mode for metric in metrics))
         self.assertTrue(
             all(
                 metric.evaluation_model == "gemma3:4b-it-qat (Ollama)"
@@ -123,9 +125,12 @@ class DeepEvalPipelineTests(unittest.TestCase):
             started_at="2026-01-01T00:00:00+00:00",
             duration_seconds=12.5,
             confident_enabled=True,
+            include_reason=True,
+            max_concurrent=4,
         )
 
         self.assertEqual(errors, [])
+        self.assertEqual(summary["max_concurrent"], 4)
         self.assertEqual(summary["generator_average_score"], 0.7)
         self.assertEqual(
             summary["metrics"]["Contextual Recall"]["average_score"], 0.4
@@ -163,6 +168,46 @@ class DeepEvalPipelineTests(unittest.TestCase):
             started_at="2026-01-01T00:00:00+00:00",
             duration_seconds=1,
             confident_enabled=False,
+            include_reason=True,
         )
 
         self.assertEqual(len(errors), 3)
+
+    def test_summary_keeps_cases_missing_from_partial_deepeval_result(self) -> None:
+        expected_case = build_test_cases(
+            [
+                {
+                    "id": "q-001",
+                    "input": "Question?",
+                    "actual_output": "Generated answer.",
+                    "retrieval_context": ["Retrieved evidence."],
+                }
+            ],
+            [
+                {
+                    "input": "Question?",
+                    "expected_output": "Expected answer.",
+                    "additional_metadata": {"id": "q-001"},
+                }
+            ],
+            "qwen",
+            1,
+        )
+
+        summary, errors = summarize_result(
+            raw_result={"test_results": []},
+            response_model="qwen",
+            judge_model="gemma3:4b-it-qat",
+            threshold=0.5,
+            expected_count=1,
+            started_at="2026-01-01T00:00:00+00:00",
+            duration_seconds=1,
+            confident_enabled=False,
+            include_reason=False,
+            max_concurrent=2,
+            expected_cases=expected_case,
+        )
+
+        self.assertEqual([case["id"] for case in summary["cases"]], ["q-001"])
+        self.assertEqual(summary["cases"][0]["metrics"], {})
+        self.assertTrue(any("test result is missing" in error for error in errors))
