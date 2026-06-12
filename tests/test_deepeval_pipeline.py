@@ -24,6 +24,7 @@ class DeepEvalPipelineTests(unittest.TestCase):
             "gemma3:4b-it-qat",
             "http://127.0.0.1:11434",
             0.5,
+            async_mode=True,
         )
 
         self.assertEqual(
@@ -35,6 +36,7 @@ class DeepEvalPipelineTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(metric.threshold == 0.5 for metric in metrics))
+        self.assertTrue(all(metric.async_mode for metric in metrics))
         self.assertTrue(
             all(
                 metric.evaluation_model == "gemma3:4b-it-qat (Ollama)"
@@ -123,9 +125,12 @@ class DeepEvalPipelineTests(unittest.TestCase):
             started_at="2026-01-01T00:00:00+00:00",
             duration_seconds=12.5,
             confident_enabled=True,
+            include_reason=True,
+            max_concurrent=4,
         )
 
         self.assertEqual(errors, [])
+        self.assertEqual(summary["max_concurrent"], 4)
         self.assertEqual(summary["generator_average_score"], 0.7)
         self.assertEqual(
             summary["metrics"]["Contextual Recall"]["average_score"], 0.4
@@ -163,6 +168,7 @@ class DeepEvalPipelineTests(unittest.TestCase):
             started_at="2026-01-01T00:00:00+00:00",
             duration_seconds=1,
             confident_enabled=False,
+            include_reason=True,
         )
 
         self.assertEqual(len(errors), 3)
