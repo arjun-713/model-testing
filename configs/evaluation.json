@@ -17,5 +17,5 @@
   "metric_threshold": 0.5,
   "minimum_metric_coverage": 0.9,
   "minimum_metric_pass_rate": 0.0,
-  "trial_id": "trial-1"
+  "trial_id": "trial-2"
 }
