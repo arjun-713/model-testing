@@ -286,11 +286,34 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          export EVAL_RESPONSES_FILE="$GITHUB_WORKSPACE/$RESULTS_DIR/responses.json"
+          export EVAL_GOLDENS_FILE="$GITHUB_WORKSPACE/dataset/golden_dataset.json"
+          export EVAL_RESULT_DIR="$GITHUB_WORKSPACE/$RESULTS_DIR/pytest-results"
+          export EVAL_RESPONSE_MODEL="$RESPONSE_MODEL"
+          export EVAL_JUDGE_MODEL="$JUDGE_MODEL"
+          export EVAL_THRESHOLD="$METRIC_THRESHOLD"
+          export EVAL_INCLUDE_REASON="$INCLUDE_REASON"
+          export PYTHONPATH="$GITHUB_WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
+          mkdir -p "$EVAL_RESULT_DIR"
+          started_at=$(date -u +%Y-%m-%dT%H:%M:%S%:z)
+          started_epoch=$(date +%s)
+          set +e
+          deepeval test run tests/evals/test_shard_deepeval.py \
+            -n 2 \
+            --identifier "qwen-gemma-$TRIAL_ID-${{ github.run_id }}-shard-${{ matrix.shard }}" \
+            --ignore-errors \
+            --display all \
+            2>&1 | tee "$RESULTS_DIR/deepeval-test-console.log"
+          test_status=${PIPESTATUS[0]}
+          set -e
+          completed_epoch=$(date +%s)
           reason_flag="--no-include-reason"
           if [[ "$INCLUDE_REASON" == "true" ]]; then
             reason_flag="--include-reason"
           fi
-          python -m evals.run_evaluation \
+          set +e
+          python -m evals.collect_pytest_results \
+            --result-dir "$EVAL_RESULT_DIR" \
             --responses "$RESULTS_DIR/responses.json" \
             --goldens dataset/golden_dataset.json \
             --output-dir "$RESULTS_DIR" \
@@ -298,11 +321,17 @@ jobs:
             --judge-model "$JUDGE_MODEL" \
             --expected-count '${{ matrix.limit }}' \
             --threshold "$METRIC_THRESHOLD" \
-            --max-concurrent "$DEEPEVAL_MAX_CONCURRENT" \
-            --max-attempts 3 \
+            --workers 2 \
+            --started-at "$started_at" \
+            --duration-seconds "$((completed_epoch - started_epoch))" \
             "$reason_flag" \
-            --identifier "qwen-gemma-$TRIAL_ID-${{ github.run_id }}-shard-${{ matrix.shard }}" \
             2>&1 | tee "$RESULTS_DIR/deepeval-console.log"
+          collect_status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$test_status" -ne 0 ]]; then
+            echo "deepeval test run exited with $test_status; collected results will be retried." >&2
+          fi
+          exit "$collect_status"
 
       - name: Retry only missing metric scores
         id: retry
@@ -323,6 +352,7 @@ jobs:
             --judge-model "$JUDGE_MODEL" \
             --threshold "$METRIC_THRESHOLD" \
             --max-concurrent "$DEEPEVAL_MAX_CONCURRENT" \
+            --max-attempts 3 \
             "$reason_flag" \
             2>&1 | tee "$RESULTS_DIR/retry-console.log"
 
