@@ -82,10 +82,27 @@ def build_test_cases(
             raise ValueError(f"{response_id}: actual_output is empty.")
         if not isinstance(expected_output, str) or not expected_output.strip():
             raise ValueError(f"{response_id}: expected_output is empty.")
-        if not isinstance(retrieval_context, list) or not all(
-            isinstance(context, str) for context in retrieval_context
-        ):
-            raise ValueError(f"{response_id}: retrieval_context is invalid.")
+        valid_retrieval_context = (
+            isinstance(retrieval_context, list)
+            and all(isinstance(context, str) for context in retrieval_context)
+            and any(context.strip() for context in retrieval_context)
+        )
+        if not valid_retrieval_context:
+            golden_context = golden.get("context")
+            if (
+                isinstance(golden_context, list)
+                and all(isinstance(context, str) for context in golden_context)
+                and any(context.strip() for context in golden_context)
+            ):
+                retrieval_context = golden_context
+            else:
+                raise ValueError(
+                    f"{response_id}: retrieval_context is missing or empty and "
+                    "the golden has no valid context fallback."
+                )
+        retrieval_context = [
+            context.strip() for context in retrieval_context if context.strip()
+        ]
 
         golden_metadata = golden.get("additional_metadata")
         category = (
@@ -104,6 +121,10 @@ def build_test_cases(
                     "id": response_id,
                     "category": category,
                     "response_model": response_model,
+                    "retrieval_context_count": len(retrieval_context),
+                    "retrieval_context_characters": sum(
+                        len(context) for context in retrieval_context
+                    ),
                 },
                 tags=[response_model, str(category or "uncategorized")],
             )
@@ -159,11 +180,13 @@ def summarize_result(
                     "input": case.input,
                     "actual_output": case.actual_output,
                     "expected_output": case.expected_output,
+                    "metadata": case.metadata,
                     "metrics_data": [],
                 }
             ordered_results.append((case_id, result))
 
     for case_id, result in ordered_results:
+        metadata = result.get("metadata")
         metric_data = result.get("metrics_data")
         if not isinstance(metric_data, list):
             errors.append(f"{case_id}: metrics_data is missing.")
@@ -208,6 +231,16 @@ def summarize_result(
                 "input": result.get("input"),
                 "actual_output": result.get("actual_output"),
                 "expected_output": result.get("expected_output"),
+                "retrieval_context_count": (
+                    metadata.get("retrieval_context_count")
+                    if isinstance(metadata, dict)
+                    else None
+                ),
+                "retrieval_context_characters": (
+                    metadata.get("retrieval_context_characters")
+                    if isinstance(metadata, dict)
+                    else None
+                ),
                 "metrics": case_metrics,
             }
         )

@@ -71,6 +71,31 @@ class DeepEvalPipelineTests(unittest.TestCase):
         self.assertEqual(test_cases[0].retrieval_context, ["Retrieved evidence."])
         self.assertEqual(test_cases[0].metadata["response_model"], "qwen")
 
+    def test_build_test_cases_uses_golden_context_only_when_retrieval_is_empty(self) -> None:
+        responses = [
+            {
+                "id": "q-001",
+                "input": "Question?",
+                "actual_output": "Generated answer.",
+                "retrieval_context": ["   "],
+            }
+        ]
+        goldens = [
+            {
+                "input": "Question?",
+                "expected_output": "Expected answer.",
+                "context": ["Curated fallback context."],
+                "additional_metadata": {"id": "q-001"},
+            }
+        ]
+
+        test_cases = build_test_cases(responses, goldens, "qwen", 1)
+
+        self.assertEqual(
+            test_cases[0].retrieval_context, ["Curated fallback context."]
+        )
+        self.assertEqual(test_cases[0].metadata["retrieval_context_count"], 1)
+
     def test_summary_exports_scores_reasons_and_generator_average(self) -> None:
         metrics = [
             {

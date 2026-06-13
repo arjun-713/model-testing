@@ -9,7 +9,7 @@
   "response_temperature": 0.1,
   "response_num_ctx": 16384,
   "response_prompt_profile": "concise",
-  "judge_max_tokens": 4024,
+  "judge_max_tokens": 4028,
   "judge_temperature": 0.0,
   "judge_num_ctx": 16384,
   "include_reason": false,

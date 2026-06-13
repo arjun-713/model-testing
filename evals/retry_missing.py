@@ -99,7 +99,7 @@ def retry(args: argparse.Namespace) -> int:
         }
         summary.setdefault("cases", []).append(case)
         summary_cases[case_id] = case
-    pairs = missing_pairs(summary)
+    initial_pairs = missing_pairs(summary)
     retry_log: list[dict[str, Any]] = []
     started = time.perf_counter()
 
@@ -120,26 +120,70 @@ def retry(args: argparse.Namespace) -> int:
         payload = metric_payload(metric, error)
         return case_id, metric_name, payload
 
-    with ThreadPoolExecutor(max_workers=args.max_concurrent) as executor:
-        measured = list(executor.map(measure_pair, pairs))
+    pending = initial_pairs
+    for attempt in range(1, args.max_attempts + 1):
+        if not pending:
+            break
+        print(f"Retry round {attempt}: {len(pending)} missing metric scores")
+        with ThreadPoolExecutor(max_workers=args.max_concurrent) as executor:
+            measured = list(executor.map(measure_pair, pending))
 
-    for case_id, metric_name, payload in measured:
-        summary_cases[case_id].setdefault("metrics", {})[metric_name] = payload
-        retry_log.append(
-            {
+        next_pending: list[tuple[str, str]] = []
+        for case_id, metric_name, payload in measured:
+            summary_cases[case_id].setdefault("metrics", {})[metric_name] = payload
+            recovered = isinstance(payload["score"], (int, float))
+            context_chars = sum(
+                len(context)
+                for context in cases_by_id[case_id].retrieval_context or []
+            )
+            item = {
+                "attempt": attempt,
                 "id": case_id,
                 "metric": metric_name,
+                "retrieval_context_count": len(
+                    cases_by_id[case_id].retrieval_context or []
+                ),
+                "retrieval_context_characters": context_chars,
                 "score": payload["score"],
                 "error": payload["error"],
             }
-        )
+            retry_log.append(item)
+            print(json.dumps(item, ensure_ascii=False))
+            if not recovered:
+                next_pending.append((case_id, metric_name))
+        pending = next_pending
 
     recompute_summary(summary)
     summary["retry"] = {
-        "attempted_count": len(pairs),
+        "initial_missing_count": len(initial_pairs),
+        "attempted_count": len(retry_log),
         "recovered_count": sum(
-            isinstance(item["score"], (int, float)) for item in retry_log
+            1
+            for pair in initial_pairs
+            if isinstance(
+                summary_cases[pair[0]].get("metrics", {}).get(pair[1], {}).get("score"),
+                (int, float),
+            )
         ),
+        "unresolved_count": len(pending),
+        "unresolved": [
+            {
+                "id": case_id,
+                "metric": metric_name,
+                "retrieval_context_count": len(
+                    cases_by_id[case_id].retrieval_context or []
+                ),
+                "retrieval_context_characters": sum(
+                    len(context)
+                    for context in cases_by_id[case_id].retrieval_context or []
+                ),
+                "error": summary_cases[case_id]
+                .get("metrics", {})
+                .get(metric_name, {})
+                .get("error"),
+            }
+            for case_id, metric_name in pending
+        ],
         "duration_seconds": round(time.perf_counter() - started, 3),
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "results": retry_log,
@@ -147,7 +191,7 @@ def retry(args: argparse.Namespace) -> int:
     save_json(args.summary, summary)
     save_json(args.output, summary["retry"])
     print(
-        f"Retried {len(pairs)} missing metric scores; "
+        f"Retried {len(initial_pairs)} initially missing metric scores; "
         f"recovered {summary['retry']['recovered_count']}."
     )
     return 0
@@ -163,6 +207,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-model", required=True)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--max-concurrent", type=int, default=2)
+    parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument(
         "--include-reason",
         action=argparse.BooleanOptionalAction,
@@ -175,6 +220,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.max_concurrent < 1:
         parser.error("--max-concurrent must be at least 1")
+    if args.max_attempts < 1:
+        parser.error("--max-attempts must be at least 1")
     return args
 
 

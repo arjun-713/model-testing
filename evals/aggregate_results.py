@@ -81,6 +81,24 @@ def aggregate(
         }
 
     errors = [error for summary in shard_summaries for error in summary.get("errors", [])]
+    missing_metrics: list[dict[str, Any]] = []
+    for case in cases:
+        for metric_name in METRIC_NAMES:
+            metric = case.get("metrics", {}).get(metric_name, {})
+            if not isinstance(metric.get("score"), (int, float)):
+                missing_metrics.append(
+                    {
+                        "id": case.get("id"),
+                        "metric": metric_name,
+                        "retrieval_context_count": case.get(
+                            "retrieval_context_count"
+                        ),
+                        "retrieval_context_characters": case.get(
+                            "retrieval_context_characters"
+                        ),
+                        "error": metric.get("error"),
+                    }
+                )
     gate_failures: list[str] = []
     for name in METRIC_NAMES:
         metric = metrics[name]
@@ -121,6 +139,7 @@ def aggregate(
         "metrics": metrics,
         "cases": cases,
         "errors": errors,
+        "missing_metrics": missing_metrics,
         "shards": shard_summaries,
     }
     return summary, responses
@@ -162,6 +181,15 @@ def write_report(summary: dict[str, Any], output_file: Path) -> None:
     if summary["errors"]:
         lines.extend(["", "## Errors", ""])
         lines.extend(f"- {error}" for error in summary["errors"])
+    if summary["missing_metrics"]:
+        lines.extend(["", "## Missing metric rows", ""])
+        for item in summary["missing_metrics"]:
+            lines.append(
+                f"- `{item['id']}` / {item['metric']}: "
+                f"contexts={item['retrieval_context_count']}, "
+                f"characters={item['retrieval_context_characters']}, "
+                f"error={item['error']}"
+            )
     output_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

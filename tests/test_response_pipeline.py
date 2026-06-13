@@ -15,9 +15,11 @@ class ResponsePipelineTests(unittest.TestCase):
     def test_prompt_enforces_short_grounded_answers(self) -> None:
         version, prompt = PROMPT_PROFILES["concise"]
         self.assertEqual(version, "jenkins-concise-v1")
-        self.assertIn("2 to 4 complete sentences", prompt)
-        self.assertIn("no more than 120 words", prompt)
+        self.assertIn("1 to 3 complete sentences", prompt)
+        self.assertIn("no more than 80 words", prompt)
         self.assertIn("using only facts supported", prompt)
+        self.assertIn("Do not use external knowledge", prompt)
+        self.assertIn("Do not guess", prompt)
         self.assertIn(
             "I'm not able to answer based on the available information.",
             prompt,
