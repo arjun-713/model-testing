@@ -4,12 +4,13 @@ name: Qwen responses with Gemma DeepEval judge
   pull_request:
     branches:
       - qwen-gemma-tr1
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       question_count:
         description: Number of questions to generate and evaluate
         required: false
-        default: "10"
+        default: "50"
 
 permissions:
   contents: read
@@ -20,11 +21,21 @@ concurrency:
 
 jobs:
   prepare:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'eval')
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       question_count: ${{ steps.plan.outputs.question_count }}
       shard_count: ${{ steps.plan.outputs.shard_count }}
+      include_reason: ${{ steps.plan.outputs.include_reason }}
+      judge_max_tokens: ${{ steps.plan.outputs.judge_max_tokens }}
+      metric_threshold: ${{ steps.plan.outputs.metric_threshold }}
+      minimum_coverage: ${{ steps.plan.outputs.minimum_coverage }}
+      minimum_pass_rate: ${{ steps.plan.outputs.minimum_pass_rate }}
+      deepeval_max_concurrent: ${{ steps.plan.outputs.deepeval_max_concurrent }}
+      response_prompt_profile: ${{ steps.plan.outputs.response_prompt_profile }}
+      response_max_tokens: ${{ steps.plan.outputs.response_max_tokens }}
+      trial_id: ${{ steps.plan.outputs.trial_id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -34,9 +45,6 @@ jobs:
         run: |
           requested='${{ inputs.question_count }}'
           if [[ -z "$requested" ]]; then
-            requested='${{ vars.EVAL_QUESTION_COUNT }}'
-          fi
-          if [[ -z "$requested" ]]; then
             requested=$(jq -r '.question_count' configs/evaluation.json)
           fi
           shard_size=$(jq -r '.shard_size' configs/evaluation.json)
@@ -45,8 +53,18 @@ jobs:
             --question-count "$requested" \
             --shard-size "$shard_size" \
             --github-output "$GITHUB_OUTPUT"
+          echo "include_reason=$(jq -r '.include_reason' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "judge_max_tokens=$(jq -r '.judge_max_tokens' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "metric_threshold=$(jq -r '.metric_threshold' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "minimum_coverage=$(jq -r '.minimum_metric_coverage' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "minimum_pass_rate=$(jq -r '.minimum_metric_pass_rate' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "deepeval_max_concurrent=$(jq -r '.deepeval_max_concurrent' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "response_prompt_profile=$(jq -r '.response_prompt_profile' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "response_max_tokens=$(jq -r '.response_max_tokens' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
+          echo "trial_id=$(jq -r '.trial_id' configs/evaluation.json)" >> "$GITHUB_OUTPUT"
 
   tests:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'eval')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -58,8 +76,69 @@ jobs:
       - run: python -m pip install -r requirements-eval.txt
       - run: python -m unittest discover -s tests -v
 
+  prepare-model-cache:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'eval')
+    runs-on: ubuntu-24.04
+    env:
+      RESPONSE_MODEL: qwen3:4b-instruct
+      JUDGE_MODEL: gemma3:4b-it-qat
+      OLLAMA_MODELS: /home/runner/.ollama/models
+    steps:
+      - name: Restore prepared Ollama model cache
+        id: restore-models
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.OLLAMA_MODELS }}
+          key: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-${{ github.head_ref || github.ref_name }}-v4
+
+      - name: Install Ollama on cache miss
+        if: steps.restore-models.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -fsSL https://ollama.com/install.sh -o /tmp/install-ollama.sh
+          sh /tmp/install-ollama.sh
+
+      - name: Start Ollama on cache miss
+        if: steps.restore-models.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          sudo systemctl stop ollama 2>/dev/null || true
+          sudo pkill -x ollama 2>/dev/null || true
+          mkdir -p "$OLLAMA_MODELS"
+          nohup ollama serve > /tmp/ollama-cache-builder.log 2>&1 &
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/ollama-cache-builder.log
+          exit 1
+
+      - name: Pull quantized models once
+        if: steps.restore-models.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          ollama pull "$RESPONSE_MODEL"
+          ollama pull "$JUDGE_MODEL"
+
+      - name: Verify models are in the cache directory
+        if: steps.restore-models.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          test -d "$OLLAMA_MODELS/manifests"
+          test -d "$OLLAMA_MODELS/blobs"
+          du -sh "$OLLAMA_MODELS"
+
+      - name: Save prepared Ollama model cache
+        if: steps.restore-models.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.OLLAMA_MODELS }}
+          key: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-${{ github.head_ref || github.ref_name }}-v4
+
   generate-and-evaluate:
-    needs: [prepare, tests]
+    needs: [prepare, tests, prepare-model-cache]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     strategy:
@@ -71,12 +150,23 @@ jobs:
       RESULTS_DIR: results/shard-${{ matrix.shard }}
       RESPONSE_MODEL: qwen3:4b-instruct
       JUDGE_MODEL: gemma3:4b-it-qat
+      OLLAMA_MODELS: /home/runner/.ollama/models
+      OLLAMA_NUM_PARALLEL: ${{ needs.prepare.outputs.deepeval_max_concurrent }}
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: q8_0
+      DEEPEVAL_MAX_CONCURRENT: ${{ needs.prepare.outputs.deepeval_max_concurrent }}
       CONFIDENT_API_KEY: ${{ secrets.CONFIDENT_API_KEY }}
       DEEPEVAL_DISABLE_DOTENV: "1"
       DEEPEVAL_TELEMETRY_OPT_OUT: "1"
-      DEEPEVAL_PER_TASK_TIMEOUT_SECONDS_OVERRIDE: "900"
+      DEEPEVAL_PER_TASK_TIMEOUT_SECONDS_OVERRIDE: "3600"
       DEEPEVAL_JUDGE_NUM_CTX: "16384"
-      DEEPEVAL_JUDGE_NUM_PREDICT: "1024"
+      DEEPEVAL_JUDGE_NUM_PREDICT: ${{ needs.prepare.outputs.judge_max_tokens }}
+      INCLUDE_REASON: ${{ needs.prepare.outputs.include_reason }}
+      METRIC_THRESHOLD: ${{ needs.prepare.outputs.metric_threshold }}
+      RESPONSE_PROMPT_PROFILE: ${{ needs.prepare.outputs.response_prompt_profile }}
+      RESPONSE_MAX_TOKENS: ${{ needs.prepare.outputs.response_max_tokens }}
+      TRIAL_ID: ${{ needs.prepare.outputs.trial_id }}
 
     steps:
       - uses: actions/checkout@v4
@@ -112,9 +202,18 @@ jobs:
           sh /tmp/install-ollama.sh \
             2>&1 | tee "$RESULTS_DIR/ollama-install.log"
 
+      - name: Restore prepared quantized Ollama models
+        id: restore-models
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.OLLAMA_MODELS }}
+          key: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-${{ github.head_ref || github.ref_name }}-v4
+
       - name: Start Ollama
         shell: bash
         run: |
+          sudo systemctl stop ollama 2>/dev/null || true
+          sudo pkill -x ollama 2>/dev/null || true
           nohup ollama serve > "$RESULTS_DIR/ollama-server.log" 2>&1 &
           for attempt in {1..30}; do
             if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
@@ -125,7 +224,7 @@ jobs:
           echo "Ollama did not become ready within 60 seconds." >&2
           exit 1
 
-      - name: Pull quantized response and judge models
+      - name: Verify cached response and judge models
         shell: bash
         run: |
           started=$(date +%s)
@@ -155,9 +254,11 @@ jobs:
             --output-dir "$RESULTS_DIR" \
             --offset '${{ matrix.offset }}' \
             --limit '${{ matrix.limit }}' \
-            --max-tokens 256 \
+            --max-tokens "$RESPONSE_MAX_TOKENS" \
             --temperature 0.1 \
             --num-ctx 16384 \
+            --prompt-profile "$RESPONSE_PROMPT_PROFILE" \
+            --warm-prompt-cache \
             2>&1 | tee "$RESULTS_DIR/response-generation-console.log"
 
       - name: Validate shard responses
@@ -170,12 +271,25 @@ jobs:
             --expected-count '${{ matrix.limit }}' \
             2>&1 | tee "$RESULTS_DIR/response-validation.log"
 
+      - name: Unload response model before DeepEval
+        if: steps.validation.outcome == 'success'
+        shell: bash
+        run: |
+          curl -fsS http://127.0.0.1:11434/api/generate \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$RESPONSE_MODEL\",\"keep_alive\":0}" \
+            > "$RESULTS_DIR/response-model-unload.json"
+
       - name: Evaluate shard immediately with Gemma
         id: evaluation
         if: steps.validation.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
+          reason_flag="--no-include-reason"
+          if [[ "$INCLUDE_REASON" == "true" ]]; then
+            reason_flag="--include-reason"
+          fi
           python -m evals.run_evaluation \
             --responses "$RESULTS_DIR/responses.json" \
             --goldens dataset/golden_dataset.json \
@@ -183,9 +297,34 @@ jobs:
             --response-model "$RESPONSE_MODEL" \
             --judge-model "$JUDGE_MODEL" \
             --expected-count '${{ matrix.limit }}' \
-            --threshold 0.5 \
-            --identifier "qwen-gemma-tr1-${{ github.run_id }}-shard-${{ matrix.shard }}" \
+            --threshold "$METRIC_THRESHOLD" \
+            --max-concurrent "$DEEPEVAL_MAX_CONCURRENT" \
+            --max-attempts 3 \
+            "$reason_flag" \
+            --identifier "qwen-gemma-$TRIAL_ID-${{ github.run_id }}-shard-${{ matrix.shard }}" \
             2>&1 | tee "$RESULTS_DIR/deepeval-console.log"
+
+      - name: Retry only missing metric scores
+        id: retry
+        if: always() && steps.validation.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          reason_flag="--no-include-reason"
+          if [[ "$INCLUDE_REASON" == "true" ]]; then
+            reason_flag="--include-reason"
+          fi
+          python -m evals.retry_missing \
+            --summary "$RESULTS_DIR/evaluation-summary.json" \
+            --responses "$RESULTS_DIR/responses.json" \
+            --goldens dataset/golden_dataset.json \
+            --output "$RESULTS_DIR/retry-summary.json" \
+            --response-model "$RESPONSE_MODEL" \
+            --judge-model "$JUDGE_MODEL" \
+            --threshold "$METRIC_THRESHOLD" \
+            --max-concurrent "$DEEPEVAL_MAX_CONCURRENT" \
+            "$reason_flag" \
+            2>&1 | tee "$RESULTS_DIR/retry-console.log"
 
       - name: Upload shard responses, metrics, and logs
         if: always()
@@ -201,15 +340,19 @@ jobs:
         env:
           GENERATION_OUTCOME: ${{ steps.generation.outcome }}
           VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
-          EVALUATION_OUTCOME: ${{ steps.evaluation.outcome }}
+          RETRY_OUTCOME: ${{ steps.retry.outcome }}
         run: |
-          if [[ "$GENERATION_OUTCOME" != "success" || "$VALIDATION_OUTCOME" != "success" || "$EVALUATION_OUTCOME" != "success" ]]; then
-            echo "Shard generation, validation, or evaluation failed." >&2
+          if [[ "$GENERATION_OUTCOME" != "success" || "$VALIDATION_OUTCOME" != "success" || "$RETRY_OUTCOME" != "success" ]]; then
+            echo "Shard generation, validation, or targeted retry failed." >&2
+            exit 1
+          fi
+          if [[ ! -f "$RESULTS_DIR/evaluation-summary.json" ]]; then
+            echo "The shard did not produce an evaluation summary." >&2
             exit 1
           fi
 
   aggregate:
-    if: always()
+    if: always() && (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'eval'))
     needs: [prepare, generate-and-evaluate]
     runs-on: ubuntu-24.04
     steps:
@@ -230,6 +373,9 @@ jobs:
             --dataset dataset/responses.json \
             --question-count '${{ needs.prepare.outputs.question_count }}' \
             --expected-shards '${{ needs.prepare.outputs.shard_count }}' \
+            --metric-threshold '${{ needs.prepare.outputs.metric_threshold }}' \
+            --minimum-coverage '${{ needs.prepare.outputs.minimum_coverage }}' \
+            --minimum-pass-rate '${{ needs.prepare.outputs.minimum_pass_rate }}' \
             --output-dir aggregate
 
       - name: Publish aggregate report
@@ -256,3 +402,4 @@ jobs:
           if [[ "$AGGREGATE_OUTCOME" != "success" ]]; then
             echo "The final aggregate report is incomplete." >&2
             exit 1
+          fi
