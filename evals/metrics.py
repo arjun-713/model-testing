@@ -11,6 +11,7 @@ from deepeval.metrics import (
 )
 from deepeval.models import OllamaModel
 
+from evals.airllm_model import AirLLMDeepEvalModel
 from evals.constants import METRIC_NAMES
 
 def build_metrics(
@@ -20,19 +21,33 @@ def build_metrics(
     include_reason: bool = True,
     async_mode: bool = False,
     metric_names: tuple[str, ...] = METRIC_NAMES,
+    judge_backend: str = "ollama",
 ):
     judge_num_ctx = int(os.environ.get("DEEPEVAL_JUDGE_NUM_CTX", "16384"))
     judge_num_predict = int(os.environ.get("DEEPEVAL_JUDGE_NUM_PREDICT", "1024"))
-    judge_model = OllamaModel(
-        model=judge_model_name,
-        base_url=base_url,
-        temperature=0.0,
-        generation_kwargs={
-            "num_ctx": judge_num_ctx,
-            "num_predict": judge_num_predict,
-            "seed": 42,
-        },
-    )
+    generation_kwargs = {
+        "num_ctx": judge_num_ctx,
+        "num_predict": judge_num_predict,
+        "seed": 42,
+    }
+    if judge_backend == "airllm":
+        airllm_compression = os.environ.get("AIRLLM_JUDGE_COMPRESSION")
+        if airllm_compression:
+            generation_kwargs["compression"] = airllm_compression
+        judge_model = AirLLMDeepEvalModel(
+            model=judge_model_name,
+            temperature=0.0,
+            generation_kwargs=generation_kwargs,
+            layer_shards_saving_path=os.environ.get("AIRLLM_JUDGE_LAYER_SHARDS_PATH"),
+            hf_token=os.environ.get("HF_TOKEN"),
+        )
+    else:
+        judge_model = OllamaModel(
+            model=judge_model_name,
+            base_url=base_url,
+            temperature=0.0,
+            generation_kwargs=generation_kwargs,
+        )
     common_options = {
         "model": judge_model,
         "threshold": threshold,

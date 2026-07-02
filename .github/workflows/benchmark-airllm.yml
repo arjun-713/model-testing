@@ -1,0 +1,473 @@
+name: Benchmark Ollama vs AirLLM
+
+"on":
+  pull_request:
+    branches:
+      - qwen-gemma-tr1
+      - codex/revert-deepeval-xdist
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      question_count:
+        description: Number of questions to benchmark
+        required: false
+        default: "50"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airllm-benchmark-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      question_count: ${{ steps.plan.outputs.question_count }}
+      shard_count: ${{ steps.plan.outputs.shard_count }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      metric_threshold: ${{ steps.plan.outputs.metric_threshold }}
+      minimum_coverage: ${{ steps.plan.outputs.minimum_coverage }}
+      minimum_pass_rate: ${{ steps.plan.outputs.minimum_pass_rate }}
+      response_max_tokens: ${{ steps.plan.outputs.response_max_tokens }}
+      judge_max_tokens: ${{ steps.plan.outputs.judge_max_tokens }}
+      include_reason: ${{ steps.plan.outputs.include_reason }}
+      deepeval_max_concurrent: ${{ steps.plan.outputs.deepeval_max_concurrent }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build benchmark matrix
+        id: plan
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            requested=10
+          else
+            requested='${{ inputs.question_count }}'
+            if [[ -z "$requested" ]]; then
+              requested=$(jq -r '.question_count' configs/evaluation.json)
+            fi
+          fi
+          shard_size=$(jq -r '.shard_size' configs/evaluation.json)
+          python scripts/build_shard_matrix.py \
+            --dataset dataset/responses.json \
+            --question-count "$requested" \
+            --shard-size "$shard_size" \
+            --github-output "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          github_output = Path(os.environ["GITHUB_OUTPUT"])
+          content = github_output.read_text(encoding="utf-8").splitlines()
+          data = {}
+          for line in content:
+            if "=" in line:
+              key, value = line.split("=", 1)
+              data[key] = value
+
+          shard_matrix = json.loads(data["matrix"])
+          combined = []
+          backends = [
+            {
+              "backend": "ollama",
+              "response_model": "qwen3:4b-instruct",
+              "judge_model": "gemma3:4b-it-qat",
+              "judge_backend": "ollama",
+              "airllm_compression": "",
+            },
+            {
+              "backend": "airllm",
+              "response_model": "Qwen/Qwen3-4B",
+              "judge_model": "gemma3:4b-it-qat",
+              "judge_backend": "ollama",
+              "airllm_compression": "4bit",
+            },
+          ]
+          for shard in shard_matrix:
+            for backend in backends:
+              combined.append({**backend, **shard})
+
+          with github_output.open("a", encoding="utf-8") as handle:
+            handle.write(
+              "matrix="
+              + json.dumps(combined, separators=(",", ":"))
+              + "\n"
+            )
+            cfg = json.loads(Path("configs/evaluation.json").read_text())
+            handle.write(f"metric_threshold={cfg['metric_threshold']}\n")
+            handle.write(
+              f"minimum_coverage={cfg['minimum_metric_coverage']}\n"
+            )
+            handle.write(
+              f"minimum_pass_rate={cfg['minimum_metric_pass_rate']}\n"
+            )
+            handle.write(f"response_max_tokens={cfg['response_max_tokens']}\n")
+            handle.write(f"judge_max_tokens={cfg['judge_max_tokens']}\n")
+            handle.write(f"include_reason={json.dumps(cfg['include_reason'])}\n")
+            handle.write(
+              f"deepeval_max_concurrent={cfg['deepeval_max_concurrent']}\n"
+            )
+          PY
+
+  benchmark:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      RESULTS_DIR: results/${{ matrix.backend }}/shard-${{ matrix.shard }}
+      RESPONSE_MODEL: ${{ matrix.response_model }}
+      JUDGE_MODEL: ${{ matrix.judge_model }}
+      JUDGE_BACKEND: ${{ matrix.judge_backend }}
+      INCLUDE_REASON: ${{ needs.prepare.outputs.include_reason }}
+      METRIC_THRESHOLD: ${{ needs.prepare.outputs.metric_threshold }}
+      RESPONSE_MAX_TOKENS: ${{ needs.prepare.outputs.response_max_tokens }}
+      DEEPEVAL_MAX_CONCURRENT: ${{ needs.prepare.outputs.deepeval_max_concurrent }}
+      DEEPEVAL_DISABLE_DOTENV: "1"
+      DEEPEVAL_TELEMETRY_OPT_OUT: "1"
+      DEEPEVAL_PER_TASK_TIMEOUT_SECONDS_OVERRIDE: "3600"
+      DEEPEVAL_JUDGE_NUM_CTX: "16384"
+      DEEPEVAL_JUDGE_NUM_PREDICT: ${{ needs.prepare.outputs.judge_max_tokens }}
+      OLLAMA_MODELS: /home/runner/.ollama/models
+      HF_HOME: /home/runner/.cache/huggingface
+      AIRLLM_DEVICE: cpu
+      AIRLLM_JUDGE_LAYER_SHARDS_PATH: /home/runner/.cache/airllm/judge
+      AIRLLM_JUDGE_COMPRESSION: ${{ matrix.airllm_compression }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      CONFIDENT_API_KEY: ${{ secrets.CONFIDENT_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-airllm.txt
+
+      - name: Restore Hugging Face cache for AirLLM
+        if: matrix.backend == 'airllm'
+        id: restore-airllm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /home/runner/.cache/huggingface
+            /home/runner/.cache/airllm
+          key: airllm-${{ runner.os }}-qwen3-4b-gemma3-4b-${{ github.head_ref || github.ref_name }}-v1
+
+      - name: Install benchmark dependencies
+        run: |
+          set -o pipefail
+          requirements=requirements-eval.txt
+          if [[ "${{ matrix.backend }}" == "airllm" ]]; then
+            requirements=requirements-airllm.txt
+          fi
+          python -m pip install -r "$requirements" \
+            2>&1 | tee dependency-install.log
+
+      - name: Restore prepared Ollama cache
+        if: matrix.backend == 'ollama'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.OLLAMA_MODELS }}
+          key: ollama-${{ runner.os }}-qwen3-4b-instruct-gemma3-4b-it-qat-${{ github.head_ref || github.ref_name }}-v4
+
+      - name: Initialize benchmark shard logs
+        shell: bash
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          jq -n \
+            --arg backend "${{ matrix.backend }}" \
+            --argjson shard '${{ matrix.shard }}' \
+            --argjson offset '${{ matrix.offset }}' \
+            --argjson limit '${{ matrix.limit }}' \
+            --arg response_model "$RESPONSE_MODEL" \
+            --arg judge_model "$JUDGE_MODEL" \
+            '{backend: $backend, shard: $shard, offset: $offset, limit: $limit, response_model: $response_model, judge_model: $judge_model}' \
+            > "$RESULTS_DIR/shard.json"
+
+      - name: Install and start Ollama
+        if: matrix.backend == 'ollama'
+        shell: bash
+        run: |
+          curl -fsSL https://ollama.com/install.sh -o /tmp/install-ollama.sh
+          sh /tmp/install-ollama.sh \
+            2>&1 | tee "$RESULTS_DIR/ollama-install.log"
+          sudo systemctl stop ollama 2>/dev/null || true
+          sudo pkill -x ollama 2>/dev/null || true
+          nohup ollama serve > "$RESULTS_DIR/ollama-server.log" 2>&1 &
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Ollama did not become ready within 60 seconds." >&2
+          exit 1
+
+      - name: Prepare Ollama models
+        if: matrix.backend == 'ollama'
+        shell: bash
+        run: |
+          set -o pipefail
+          started=$(date +%s)
+          ollama pull "$RESPONSE_MODEL" \
+            2>&1 | tee "$RESULTS_DIR/response-model-pull.log"
+          response_completed=$(date +%s)
+          ollama pull "$JUDGE_MODEL" \
+            2>&1 | tee "$RESULTS_DIR/judge-model-pull.log"
+          judge_completed=$(date +%s)
+          jq -n \
+            --arg response_model "$RESPONSE_MODEL" \
+            --arg judge_model "$JUDGE_MODEL" \
+            --argjson response_seconds "$((response_completed - started))" \
+            --argjson judge_seconds "$((judge_completed - response_completed))" \
+            '{response_model: $response_model, judge_model: $judge_model, response_pull_seconds: $response_seconds, judge_pull_seconds: $judge_seconds}' \
+            > "$RESULTS_DIR/model-pull-timing.json"
+
+      - name: Prepare AirLLM models
+        if: matrix.backend == 'airllm'
+        shell: bash
+        run: |
+          mkdir -p /home/runner/.cache/airllm/response /home/runner/.cache/airllm/judge
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from runners.airllm_backend import AirLLMSession
+
+          result_dir = Path(os.environ["RESULTS_DIR"])
+          response_started = AirLLMSession(
+            model_id=os.environ["RESPONSE_MODEL"],
+            system_prompt="Warmup response model.",
+            request_timeout=3600.0,
+            compression=os.environ.get("AIRLLM_JUDGE_COMPRESSION") or None,
+            layer_shards_saving_path=Path("/home/runner/.cache/airllm/response"),
+            profiling_mode=True,
+            hf_token=os.environ.get("HF_TOKEN"),
+            device=os.environ.get("AIRLLM_DEVICE"),
+          )
+          response_seconds = response_started.load_duration_seconds
+          payload = {
+            "response_model": os.environ["RESPONSE_MODEL"],
+            "judge_model": os.environ["JUDGE_MODEL"],
+            "response_pull_seconds": response_seconds,
+            "judge_pull_seconds": 0,
+          }
+          (result_dir / "model-pull-timing.json").write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+          )
+          PY
+
+      - name: Generate shard responses
+        id: generation
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          extra_args=()
+          if [[ "${{ matrix.backend }}" == "airllm" ]]; then
+            extra_args+=(
+              --airllm-compression "${{ matrix.airllm_compression }}"
+              --airllm-layer-shards-path /home/runner/.cache/airllm/response
+              --airllm-profiling-mode
+              --airllm-device "$AIRLLM_DEVICE"
+            )
+          fi
+          python runners/run_responses.py \
+            --backend "${{ matrix.backend }}" \
+            --model "$RESPONSE_MODEL" \
+            --model-name "${{ matrix.backend }}-qwen" \
+            --input dataset/responses.json \
+            --output-dir "$RESULTS_DIR" \
+            --offset '${{ matrix.offset }}' \
+            --limit '${{ matrix.limit }}' \
+            --max-tokens "$RESPONSE_MAX_TOKENS" \
+            --temperature 0.1 \
+            --num-ctx 16384 \
+            --prompt-profile concise \
+            --warm-prompt-cache \
+            "${extra_args[@]}" \
+            2>&1 | tee "$RESULTS_DIR/response-generation-console.log"
+
+      - name: Validate shard responses
+        id: validation
+        if: always()
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python runners/validate_responses.py \
+            "$RESULTS_DIR/responses.json" \
+            --expected-count '${{ matrix.limit }}' \
+            2>&1 | tee "$RESULTS_DIR/response-validation.log"
+
+      - name: Unload Ollama response model before judge
+        if: steps.validation.outcome == 'success' && matrix.backend == 'ollama'
+        shell: bash
+        run: |
+          curl -fsS http://127.0.0.1:11434/api/generate \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$RESPONSE_MODEL\",\"keep_alive\":0}" \
+            > "$RESULTS_DIR/response-model-unload.json"
+
+      - name: Evaluate shard
+        id: evaluation
+        if: steps.validation.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          reason_flag="--no-include-reason"
+          if [[ "$INCLUDE_REASON" == "true" ]]; then
+            reason_flag="--include-reason"
+          fi
+          python -m evals.run_evaluation \
+            --responses "$RESULTS_DIR/responses.json" \
+            --goldens dataset/golden_dataset.json \
+            --output-dir "$RESULTS_DIR" \
+            --response-model "$RESPONSE_MODEL" \
+            --judge-model "$JUDGE_MODEL" \
+            --judge-backend "$JUDGE_BACKEND" \
+            --expected-count '${{ matrix.limit }}' \
+            --threshold "$METRIC_THRESHOLD" \
+            --max-concurrent "$DEEPEVAL_MAX_CONCURRENT" \
+            "$reason_flag" \
+            --identifier "benchmark-${{ matrix.backend }}-${{ github.run_id }}-shard-${{ matrix.shard }}" \
+            2>&1 | tee "$RESULTS_DIR/deepeval-console.log"
+
+      - name: Retry missing metric scores
+        id: retry
+        if: always() && steps.validation.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          reason_flag="--no-include-reason"
+          if [[ "$INCLUDE_REASON" == "true" ]]; then
+            reason_flag="--include-reason"
+          fi
+          python -m evals.retry_missing \
+            --summary "$RESULTS_DIR/evaluation-summary.json" \
+            --responses "$RESULTS_DIR/responses.json" \
+            --goldens dataset/golden_dataset.json \
+            --output "$RESULTS_DIR/retry-summary.json" \
+            --response-model "$RESPONSE_MODEL" \
+            --judge-model "$JUDGE_MODEL" \
+            --judge-backend "$JUDGE_BACKEND" \
+            --threshold "$METRIC_THRESHOLD" \
+            --max-concurrent "$DEEPEVAL_MAX_CONCURRENT" \
+            "$reason_flag" \
+            2>&1 | tee "$RESULTS_DIR/retry-console.log"
+
+      - name: Save Hugging Face cache
+        if: always() && matrix.backend == 'airllm' && steps.restore-airllm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /home/runner/.cache/huggingface
+            /home/runner/.cache/airllm
+          key: airllm-${{ runner.os }}-qwen3-4b-gemma3-4b-${{ github.head_ref || github.ref_name }}-v1
+
+      - name: Upload benchmark shard artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.backend }}-shard-${{ matrix.shard }}
+          path: ${{ env.RESULTS_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce benchmark shard success
+        if: always()
+        env:
+          GENERATION_OUTCOME: ${{ steps.generation.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
+          RETRY_OUTCOME: ${{ steps.retry.outcome }}
+        run: |
+          if [[ "$GENERATION_OUTCOME" != "success" || "$VALIDATION_OUTCOME" != "success" || "$RETRY_OUTCOME" != "success" ]]; then
+            echo "Benchmark shard failed." >&2
+            exit 1
+          fi
+
+  aggregate:
+    needs: [prepare, benchmark]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [ollama, airllm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download backend shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ matrix.backend }}-shard-*
+          path: artifacts
+
+      - name: Normalize shard directories
+        shell: bash
+        run: |
+          index=1
+          for dir in $(find artifacts -maxdepth 1 -type d -name '${{ matrix.backend }}-shard-*' | sort); do
+            mv "$dir" "artifacts/shard-$index"
+            index=$((index + 1))
+          done
+
+      - name: Aggregate backend benchmark
+        run: |
+          python -m evals.aggregate_results \
+            --artifact-dir artifacts \
+            --dataset dataset/responses.json \
+            --question-count '${{ needs.prepare.outputs.question_count }}' \
+            --expected-shards '${{ needs.prepare.outputs.shard_count }}' \
+            --metric-threshold '${{ needs.prepare.outputs.metric_threshold }}' \
+            --minimum-coverage '${{ needs.prepare.outputs.minimum_coverage }}' \
+            --minimum-pass-rate '${{ needs.prepare.outputs.minimum_pass_rate }}' \
+            --output-dir aggregate/${{ matrix.backend }}
+
+      - name: Upload backend aggregate
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.backend }}-aggregate
+          path: aggregate/${{ matrix.backend }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  compare:
+    needs: aggregate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download backend aggregates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-*-aggregate
+          path: compare-inputs
+
+      - name: Build benchmark comparison report
+        run: |
+          python -m evals.compare_backend_results \
+            --summary compare-inputs/benchmark-ollama-aggregate/evaluation-summary.json \
+            --summary compare-inputs/benchmark-airllm-aggregate/evaluation-summary.json \
+            --output-dir compare-output
+
+      - name: Publish benchmark summary
+        run: |
+          cat compare-output/backend-compare.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: airllm-benchmark-report-${{ github.run_id }}
+          path: compare-output/
+          if-no-files-found: error
+          retention-days: 30
