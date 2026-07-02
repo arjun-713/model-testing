@@ -16,7 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from runners.airllm_backend import AirLLMSession
+try:
+    from runners.airllm_backend import AirLLMSession
+except ModuleNotFoundError:
+    from airllm_backend import AirLLMSession
 
 try:
     from runners.validate_responses import validate_entries

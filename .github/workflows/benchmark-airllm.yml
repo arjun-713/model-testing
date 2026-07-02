@@ -80,9 +80,9 @@ jobs:
             },
             {
               "backend": "airllm",
-              "response_model": "Qwen/Qwen3-4B-Instruct",
-              "judge_model": "google/gemma-3-4b-it",
-              "judge_backend": "airllm",
+              "response_model": "Qwen/Qwen3-4B",
+              "judge_model": "gemma3:4b-it-qat",
+              "judge_backend": "ollama",
               "airllm_compression": "4bit",
             },
           ]
@@ -140,6 +140,7 @@ jobs:
       AIRLLM_DEVICE: cpu
       AIRLLM_JUDGE_LAYER_SHARDS_PATH: /home/runner/.cache/airllm/judge
       AIRLLM_JUDGE_COMPRESSION: ${{ matrix.airllm_compression }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
       CONFIDENT_API_KEY: ${{ secrets.CONFIDENT_API_KEY }}
     steps:
       - uses: actions/checkout@v4
@@ -162,6 +163,7 @@ jobs:
 
       - name: Install benchmark dependencies
         run: |
+          set -o pipefail
           requirements=requirements-eval.txt
           if [[ "${{ matrix.backend }}" == "airllm" ]]; then
             requirements=requirements-airllm.txt
@@ -213,6 +215,7 @@ jobs:
         if: matrix.backend == 'ollama'
         shell: bash
         run: |
+          set -o pipefail
           started=$(date +%s)
           ollama pull "$RESPONSE_MODEL" \
             2>&1 | tee "$RESULTS_DIR/response-model-pull.log"
@@ -251,22 +254,11 @@ jobs:
             device=os.environ.get("AIRLLM_DEVICE"),
           )
           response_seconds = response_started.load_duration_seconds
-          judge_started = AirLLMSession(
-            model_id=os.environ["JUDGE_MODEL"],
-            system_prompt="Warmup judge model.",
-            request_timeout=3600.0,
-            compression=os.environ.get("AIRLLM_JUDGE_COMPRESSION") or None,
-            layer_shards_saving_path=Path("/home/runner/.cache/airllm/judge"),
-            profiling_mode=True,
-            hf_token=os.environ.get("HF_TOKEN"),
-            device=os.environ.get("AIRLLM_DEVICE"),
-          )
-          judge_seconds = judge_started.load_duration_seconds
           payload = {
             "response_model": os.environ["RESPONSE_MODEL"],
             "judge_model": os.environ["JUDGE_MODEL"],
             "response_pull_seconds": response_seconds,
-            "judge_pull_seconds": judge_seconds,
+            "judge_pull_seconds": 0,
           }
           (result_dir / "model-pull-timing.json").write_text(
             json.dumps(payload, indent=2) + "\n",
@@ -279,6 +271,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          set -o pipefail
           extra_args=()
           if [[ "${{ matrix.backend }}" == "airllm" ]]; then
             extra_args+=(
@@ -309,6 +302,7 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          set -o pipefail
           python runners/validate_responses.py \
             "$RESULTS_DIR/responses.json" \
             --expected-count '${{ matrix.limit }}' \
@@ -329,6 +323,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          set -o pipefail
           reason_flag="--no-include-reason"
           if [[ "$INCLUDE_REASON" == "true" ]]; then
             reason_flag="--include-reason"
@@ -353,6 +348,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          set -o pipefail
           reason_flag="--no-include-reason"
           if [[ "$INCLUDE_REASON" == "true" ]]; then
             reason_flag="--include-reason"
