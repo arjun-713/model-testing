@@ -35,6 +35,7 @@ def aggregate(
     summary_files = sorted(artifact_dir.glob("shard-*/evaluation-summary.json"))
     response_files = sorted(artifact_dir.glob("shard-*/responses.json"))
     generation_files = sorted(artifact_dir.glob("shard-*/summary.json"))
+    model_prep_files = sorted(artifact_dir.glob("shard-*/model-pull-timing.json"))
     if len(summary_files) != expected_shards:
         raise ValueError(
             f"Expected {expected_shards} evaluation summaries, found {len(summary_files)}"
@@ -46,6 +47,7 @@ def aggregate(
 
     shard_summaries = [load_json(path) for path in summary_files]
     generation_summaries = [load_json(path) for path in generation_files]
+    model_prep_summaries = [load_json(path) for path in model_prep_files]
     responses = [entry for path in response_files for entry in load_json(path)]
     source = load_json(dataset_file)[:question_count]
     source_order = {entry["id"]: index for index, entry in enumerate(source)}
@@ -116,8 +118,10 @@ def aggregate(
             )
 
     summary = {
+        "backend": generation_summaries[0].get("backend"),
         "response_model": shard_summaries[0].get("response_model"),
         "judge_model": shard_summaries[0].get("judge_model"),
+        "judge_backend": shard_summaries[0].get("judge_backend", "ollama"),
         "question_count": question_count,
         "shard_count": expected_shards,
         "include_reason": shard_summaries[0].get("include_reason"),
@@ -131,6 +135,14 @@ def aggregate(
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "generation_total_seconds": round(
             sum(float(item.get("total_duration_seconds", 0)) for item in generation_summaries),
+            3,
+        ),
+        "model_prep_total_seconds": round(
+            sum(
+                float(item.get("response_pull_seconds", 0))
+                + float(item.get("judge_pull_seconds", 0))
+                for item in model_prep_summaries
+            ),
             3,
         ),
         "evaluation_total_seconds": round(
@@ -149,12 +161,15 @@ def write_report(summary: dict[str, Any], output_file: Path) -> None:
     lines = [
         "# Qwen response and Gemma judge report",
         "",
+        f"- Backend: `{summary.get('backend')}`",
         f"- Response model: `{summary['response_model']}`",
         f"- Judge model: `{summary['judge_model']}`",
+        f"- Judge backend: `{summary.get('judge_backend', 'ollama')}`",
         f"- Questions: {summary['question_count']}",
         f"- Shards: {summary['shard_count']}",
         f"- Judge reasons: {summary.get('include_reason')}",
         f"- Quality gate: {'PASS' if summary['gates']['passed'] else 'FAIL'}",
+        f"- Sum of model prep time: {summary['model_prep_total_seconds']} seconds",
         f"- Sum of generation time: {summary['generation_total_seconds']} seconds",
         f"- Sum of evaluation time: {summary['evaluation_total_seconds']} seconds",
         "",

@@ -207,6 +207,65 @@ class ResponsePipelineTests(unittest.TestCase):
                 20,
             )
 
+    def test_runner_records_airllm_backend_in_summary(self) -> None:
+        source = [
+            {
+                "id": "q-001",
+                "input": "Question?",
+                "actual_output": "",
+                "retrieval_context": ["Context."],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            input_file = root / "responses.json"
+            output_dir = root / "results"
+            input_file.write_text(json.dumps(source), encoding="utf-8")
+            args = argparse.Namespace(
+                backend="airllm",
+                model="Qwen/Qwen3-4B-Instruct",
+                model_name="airllm-qwen",
+                input=input_file,
+                output_dir=output_dir,
+                offset=0,
+                limit=1,
+                max_tokens=256,
+                num_ctx=4096,
+                temperature=0.1,
+                base_url="http://127.0.0.1:11434",
+                request_timeout=5.0,
+                retries=0,
+                prompt_profile="concise",
+                warm_prompt_cache=False,
+                airllm_compression="4bit",
+                airllm_layer_shards_path=None,
+                airllm_profiling_mode=False,
+                airllm_device="cpu",
+            )
+
+            fake_session = type("FakeSession", (), {"load_duration_seconds": 1.25})()
+            response = {
+                "message": {"content": "Answer."},
+                "prompt_eval_duration": 10,
+                "prompt_eval_count": 8,
+                "eval_count": 2,
+            }
+
+            with patch(
+                "runners.run_responses.build_backend_session",
+                return_value=fake_session,
+            ), patch(
+                "runners.run_responses.generate_response",
+                return_value=response,
+            ):
+                self.assertEqual(run(args), 0)
+
+            summary = json.loads(
+                (output_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["backend"], "airllm")
+            self.assertEqual(summary["backend_load_seconds"], 1.25)
+
 
 if __name__ == "__main__":
     unittest.main()

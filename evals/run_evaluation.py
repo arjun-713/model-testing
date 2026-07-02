@@ -145,6 +145,7 @@ def summarize_result(
     max_concurrent: int = 1,
     metric_names: tuple[str, ...] = METRIC_NAMES,
     expected_cases: list[LLMTestCase] | None = None,
+    judge_backend: str = "ollama",
 ) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     test_results = raw_result.get("test_results")
@@ -267,6 +268,7 @@ def summarize_result(
     summary = {
         "response_model": response_model,
         "judge_model": judge_model,
+        "judge_backend": judge_backend,
         "threshold": threshold,
         "question_count": expected_count,
         "started_at": started_at,
@@ -293,6 +295,7 @@ def write_report(summary: dict[str, Any], output_file: Path) -> None:
         f"# DeepEval report: {summary['response_model']}",
         "",
         f"- Judge model: `{summary['judge_model']}`",
+        f"- Judge backend: `{summary.get('judge_backend', 'ollama')}`",
         f"- Questions: {summary['question_count']}",
         f"- Evaluation time: {summary['duration_seconds']} seconds",
         f"- Concurrent workers: {summary['max_concurrent']}",
@@ -342,6 +345,7 @@ def run(args: argparse.Namespace) -> int:
         error_summary = {
             "response_model": args.response_model,
             "judge_model": args.judge_model,
+            "judge_backend": args.judge_backend,
             "errors": [str(exc)],
         }
         save_json(args.output_dir / "evaluation-summary.json", error_summary)
@@ -353,6 +357,7 @@ def run(args: argparse.Namespace) -> int:
         args.base_url,
         args.threshold,
         include_reason=args.include_reason,
+        judge_backend=args.judge_backend,
         # Two test cases run concurrently. Metrics inside each case stay
         # sequential so Ollama never receives six judge requests at once.
         async_mode=False,
@@ -362,7 +367,7 @@ def run(args: argparse.Namespace) -> int:
     print(
         f"Evaluating {len(test_cases)} responses from {args.response_model} "
         f"with judge {args.judge_model} using "
-        f"{args.max_concurrent} concurrent workers"
+        f"{args.max_concurrent} concurrent workers on backend {args.judge_backend}"
     )
     try:
         result = evaluate(
@@ -372,6 +377,7 @@ def run(args: argparse.Namespace) -> int:
             hyperparameters={
                 "response_model": args.response_model,
                 "judge_model": args.judge_model,
+                "judge_backend": args.judge_backend,
                 "question_count": args.expected_count,
                 "threshold": args.threshold,
                 "include_reason": args.include_reason,
@@ -401,6 +407,7 @@ def run(args: argparse.Namespace) -> int:
         error_summary = {
             "response_model": args.response_model,
             "judge_model": args.judge_model,
+            "judge_backend": args.judge_backend,
             "started_at": started_at,
             "completed_at": utc_now(),
             "duration_seconds": round(duration, 3),
@@ -417,6 +424,7 @@ def run(args: argparse.Namespace) -> int:
         raw_result=raw_result,
         response_model=args.response_model,
         judge_model=args.judge_model,
+        judge_backend=args.judge_backend,
         threshold=args.threshold,
         expected_count=args.expected_count,
         started_at=started_at,
@@ -451,6 +459,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--response-model", required=True)
     parser.add_argument("--judge-model", default="gemma3:4b-it-qat")
+    parser.add_argument(
+        "--judge-backend",
+        choices=("ollama", "airllm"),
+        default="ollama",
+    )
     parser.add_argument("--expected-count", type=int, default=10)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(

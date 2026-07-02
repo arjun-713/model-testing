@@ -111,6 +111,7 @@ def retry(args: argparse.Namespace) -> int:
             args.threshold,
             include_reason=args.include_reason,
             metric_names=(metric_name,),
+            judge_backend=args.judge_backend,
         )[0]
         error: str | None = None
         try:
@@ -205,6 +206,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--response-model", required=True)
     parser.add_argument("--judge-model", required=True)
+    parser.add_argument(
+        "--judge-backend",
+        choices=("ollama", "airllm"),
+        default="ollama",
+    )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--max-concurrent", type=int, default=2)
     parser.add_argument("--max-attempts", type=int, default=3)

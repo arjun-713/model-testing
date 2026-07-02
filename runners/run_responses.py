@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fill response outputs with a model served by Ollama."""
+"""Fill response outputs with a model served by Ollama or AirLLM."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from runners.airllm_backend import AirLLMSession
 
 try:
     from runners.validate_responses import validate_entries
@@ -159,6 +161,65 @@ def post_chat(
         raise RuntimeError(f"Could not reach Ollama: {exc.reason}") from exc
 
 
+def build_backend_session(
+    *,
+    backend: str,
+    model: str,
+    system_prompt: str,
+    request_timeout: float,
+    airllm_compression: str | None,
+    airllm_layer_shards_path: Path | None,
+    airllm_profiling_mode: bool,
+    airllm_device: str | None,
+) -> AirLLMSession | None:
+    if backend != "airllm":
+        return None
+    return AirLLMSession(
+        model_id=model,
+        system_prompt=system_prompt,
+        request_timeout=request_timeout,
+        compression=airllm_compression,
+        layer_shards_saving_path=airllm_layer_shards_path,
+        profiling_mode=airllm_profiling_mode,
+        hf_token=os.environ.get("HF_TOKEN"),
+        device=airllm_device,
+    )
+
+
+def generate_response(
+    *,
+    backend: str,
+    backend_session: AirLLMSession | None,
+    base_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    num_ctx: int,
+    temperature: float,
+    timeout: float,
+    system_prompt: str,
+) -> dict[str, Any]:
+    if backend == "airllm":
+        if backend_session is None:
+            raise RuntimeError("AirLLM backend session was not initialized.")
+        return backend_session.generate(
+            user_prompt=prompt,
+            max_tokens=max_tokens,
+            num_ctx=num_ctx,
+            temperature=temperature,
+        )
+    return post_chat(
+        base_url=base_url,
+        model=model,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        num_ctx=num_ctx,
+        temperature=temperature,
+        timeout=timeout,
+        system_prompt=system_prompt,
+    )
+
+
 def save_json(path: Path, value: Any) -> None:
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     temporary_path.write_text(
@@ -177,6 +238,7 @@ def run(args: argparse.Namespace) -> int:
     logger = configure_logging(log_file)
     prompt_profile = getattr(args, "prompt_profile", "concise")
     prompt_version, system_prompt = PROMPT_PROFILES[prompt_profile]
+    backend = getattr(args, "backend", "ollama")
 
     try:
         source_entries = json.loads(args.input.read_text(encoding="utf-8"))
@@ -207,6 +269,24 @@ def run(args: argparse.Namespace) -> int:
     failures: list[str] = []
     durations: list[float] = []
     prompt_eval_durations: list[int] = []
+    backend_session: AirLLMSession | None = None
+    backend_load_seconds: float | None = None
+    if backend == "airllm":
+        try:
+            backend_session = build_backend_session(
+                backend=backend,
+                model=args.model,
+                system_prompt=system_prompt,
+                request_timeout=args.request_timeout,
+                airllm_compression=args.airllm_compression,
+                airllm_layer_shards_path=args.airllm_layer_shards_path,
+                airllm_profiling_mode=args.airllm_profiling_mode,
+                airllm_device=args.airllm_device,
+            )
+            backend_load_seconds = backend_session.load_duration_seconds
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            return 1
     append_jsonl(
         jsonl_file,
         {
@@ -224,12 +304,13 @@ def run(args: argparse.Namespace) -> int:
             "num_ctx": args.num_ctx,
             "temperature": args.temperature,
             "ollama_base_url": args.base_url,
+            "backend": backend,
         },
     )
     logger.info(
-        "Starting model=%s ollama_model=%s offset=%d questions=%d max_tokens=%d temperature=%.2f",
+        "Starting backend=%s model=%s offset=%d questions=%d max_tokens=%d temperature=%.2f",
+        backend,
         args.model_name,
-        args.model,
         args.offset,
         len(entries),
         args.max_tokens,
@@ -241,7 +322,9 @@ def run(args: argparse.Namespace) -> int:
     if warm_prompt_cache:
         warmup_started = time.perf_counter()
         try:
-            warmup = post_chat(
+            warmup = generate_response(
+                backend=backend,
+                backend_session=backend_session,
                 base_url=args.base_url,
                 model=args.model,
                 prompt="Question:\n\nRetrieval context:\n",
@@ -304,7 +387,9 @@ def run(args: argparse.Namespace) -> int:
 
         for attempt in range(1, args.retries + 2):
             try:
-                response = post_chat(
+                response = generate_response(
+                    backend=backend,
+                    backend_session=backend_session,
                     base_url=args.base_url,
                     model=args.model,
                     prompt=prompt,
@@ -339,11 +424,12 @@ def run(args: argparse.Namespace) -> int:
                     "timestamp": utc_now(),
                     "started_at": started_at,
                     "id": entry_id,
-                    "model_name": args.model_name,
-                    "model": args.model,
-                    "duration_seconds": round(elapsed, 3),
-                    "error": error,
-                },
+                "model_name": args.model_name,
+                "model": args.model,
+                "backend": backend,
+                "duration_seconds": round(elapsed, 3),
+                "error": error,
+            },
             )
             logger.error("%s failed after %.3f seconds.", entry_id, elapsed)
             save_json(output_file, entries)
@@ -369,6 +455,7 @@ def run(args: argparse.Namespace) -> int:
                 "question": entry["input"],
                 "model_name": args.model_name,
                 "model": args.model,
+                "backend": backend,
                 "duration_seconds": round(elapsed, 3),
                 "prompt_characters": len(prompt),
                 "actual_output": output,
@@ -402,6 +489,7 @@ def run(args: argparse.Namespace) -> int:
     summary = {
         "model_name": args.model_name,
         "model": args.model,
+        "backend": backend,
         "prompt_version": prompt_version,
         "prompt_profile": prompt_profile,
         "started_at": run_started_at,
@@ -422,6 +510,7 @@ def run(args: argparse.Namespace) -> int:
         if durations
         else None,
         "validation_errors": validation_errors,
+        "backend_load_seconds": backend_load_seconds,
         "prompt_cache": {
             "enabled": warm_prompt_cache,
             "warmup_metrics": warmup_metrics,
@@ -459,6 +548,12 @@ def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--backend",
+        choices=("ollama", "airllm"),
+        default="ollama",
+        help="Inference backend used for response generation.",
+    )
     parser.add_argument("--model", required=True, help="Ollama model tag")
     parser.add_argument("--model-name", required=True, help="Artifact-safe model name")
     parser.add_argument(
@@ -488,6 +583,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--request-timeout", type=float, default=900)
     parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--airllm-compression", choices=("4bit", "8bit"))
+    parser.add_argument("--airllm-layer-shards-path", type=Path)
+    parser.add_argument(
+        "--airllm-profiling-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--airllm-device")
     return parser.parse_args()
 
 

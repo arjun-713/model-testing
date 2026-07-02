@@ -4,6 +4,9 @@ import tempfile
 import unittest
 from importlib.util import find_spec
 from pathlib import Path
+from unittest.mock import patch
+
+from deepeval.models.base_model import DeepEvalBaseLLM
 
 from evals.metrics import build_metrics
 from evals.run_evaluation import build_test_cases, summarize_result, write_report
@@ -15,6 +18,12 @@ class DeepEvalPipelineTests(unittest.TestCase):
 
         self.assertIn("deepeval==4.0.5", requirements)
         self.assertIn("ollama==0.6.2", requirements)
+
+    def test_airllm_requirements_are_pinned_for_benchmark_workflow(self) -> None:
+        requirements = Path("requirements-airllm.txt").read_text(encoding="utf-8")
+
+        self.assertIn("-r requirements-eval.txt", requirements)
+        self.assertIn("airllm==3.0.1", requirements)
 
     def test_build_metrics_uses_gemma_ollama_judge(self) -> None:
         if find_spec("ollama") is None:
@@ -42,6 +51,37 @@ class DeepEvalPipelineTests(unittest.TestCase):
                 metric.evaluation_model == "gemma3:4b-it-qat (Ollama)"
                 for metric in metrics
             )
+        )
+
+    def test_build_metrics_can_select_airllm_judge_backend(self) -> None:
+        class FakeAirLLMModel(DeepEvalBaseLLM):
+            def load_model(self):
+                return self
+
+            def get_model_name(self):
+                return "google/gemma-3-4b-it (AirLLM)"
+
+            async def a_generate(self, *args, **kwargs):
+                return "{}", 0.0
+
+            def generate(self, *args, **kwargs):
+                return "{}", 0.0
+
+        with patch("evals.metrics.AirLLMDeepEvalModel", FakeAirLLMModel):
+            metrics = build_metrics(
+                "google/gemma-3-4b-it",
+                "http://127.0.0.1:11434",
+                0.5,
+                judge_backend="airllm",
+            )
+
+        self.assertEqual(
+            [type(metric).__name__ for metric in metrics],
+            [
+                "FaithfulnessMetric",
+                "AnswerRelevancyMetric",
+                "ContextualRecallMetric",
+            ],
         )
 
     def test_build_test_cases_joins_responses_and_goldens_by_id(self) -> None:
